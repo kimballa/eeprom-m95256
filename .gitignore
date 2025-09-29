@@ -1,0 +1,11 @@
+*.swp
+*.o
+*.a
+build
+tags
+TAGS
+__pycache__
+*.pyc
+*.pyo
+/debugger/arduino-dbg/dist
+/debugger/arduino-dbg/arduino_dbg.egg-info
