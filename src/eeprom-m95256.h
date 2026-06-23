@@ -56,6 +56,11 @@ public:
  *
  * The load() function will update the local copy from the EEPROM, and store()
  * will persist local changes back to the EEPROM storage.
+ *
+ * Note: this is a "dumb" container for data at a fixed location that does not
+ * provide CRC checking, wear-leveling, or other higher-level features of EEPROM
+ * management. See the classes in eeprom-wearlevel.h for some more advanced
+ * EEPROM storage classes.
  */
 template <typename T> class EepromBacked {
 public:
