@@ -32,6 +32,13 @@ public:
   size_t write(void *buf, addr_t addr, size_t count) override {
     size_t avail = available(addr, count);
     memcpy(_data.data() + addr, buf, avail);
+    if (_faultyByteSet && _faultyByte >= addr && _faultyByte < addr + avail) {
+      // Simulate a bad cell: this byte never durably holds what was written.
+      _data[_faultyByte] ^= 0xFF;
+    }
+    if (_writeDelayMillis > 0) {
+      advanceFakeMillis(_writeDelayMillis);
+    }
     return avail;
   }
 
@@ -39,6 +46,21 @@ public:
   uint8_t &byteAt(size_t i) { return _data.at(i); }
 
   void zeroAll() { std::fill(_data.begin(), _data.end(), 0); }
+
+  /** Make every subsequent write() advance the (fake) clock by `ms` before
+   * returning, to simulate a device whose write commit stalls. Tests use
+   * this to exercise EepromPageManager::storeRecord()'s stall-triggered
+   * relocation path without a real sleep. */
+  void setWriteDelayMillis(unsigned long ms) { _writeDelayMillis = ms; }
+
+  /** Make any write touching byte `addr` corrupt that byte afterward,
+   * simulating a bad memory cell. Tests use this to make
+   * PageBackedData::store()'s post-write readback deterministically
+   * disagree with what was written. */
+  void setFaultyByte(addr_t addr) {
+    _faultyByte = addr;
+    _faultyByteSet = true;
+  }
 
 private:
   size_t available(addr_t addr, size_t count) const {
@@ -49,6 +71,9 @@ private:
   }
 
   std::vector<uint8_t> _data;
+  unsigned long _writeDelayMillis = 0;
+  addr_t _faultyByte = 0;
+  bool _faultyByteSet = false;
 };
 
 #endif /* _FAKE_EEPROM_H */

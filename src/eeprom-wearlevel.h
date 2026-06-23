@@ -220,6 +220,8 @@ class DataMappable {
 public:
   using addr_t = uint16_t;
 
+  virtual ~DataMappable() = default;
+
   /** The number of complete hardware pages this record occupies. */
   virtual size_t sizeInPages() const = 0;
 
@@ -229,6 +231,22 @@ public:
    * backing array. The caller is responsible for ensuring ids are unique.
    */
   virtual addr_t getRecordId() const = 0;
+
+  /** The hardware page this record is currently stored at. */
+  virtual addr_t getPageNum() const = 0;
+
+  /** Reassign the hardware page this record is stored at (e.g. when relocated
+   * by a wear-leveling allocator). Does not move the stored data; call
+   * store() afterward to write the data to the new page. */
+  virtual void setPageNum(addr_t newPageNum) = 0;
+
+  /** Load this record's data from its current page. Returns false (data left
+   * unmodified) if the stored copy fails its integrity check. */
+  virtual bool load() = 0;
+
+  /** Persist this record's in-memory data to its current page. Returns false
+   * if the write could not be verified (e.g. a readback mismatch). */
+  virtual bool store() = 0;
 };
 
 /**
@@ -296,6 +314,9 @@ public:
 
     return allValid;
   };
+
+  /** Number of hardware pages needed to serialize the backing array. */
+  size_t numMapPages() const { return _numMapPages; }
 
   /** Return the page number at which the record identified by `recordId`
    * currently starts, as stored in the backing array. */
@@ -376,11 +397,13 @@ class PageBackedData : public DataMappable {
 public:
   using addr_t = uint16_t;
 
-  PageBackedData(addr_t recordId, addr_t pageNum, GenericSpiEeprom &eeprom)
-      : data(), recordId(recordId), _pageNum(pageNum), _eeprom(eeprom){};
-  PageBackedData(const T &initial, addr_t recordId, addr_t pageNum,
-                 GenericSpiEeprom &eeprom)
-      : data(initial), recordId(recordId), _pageNum(pageNum), _eeprom(eeprom){};
+  /** The page this record is stored at starts out zeroed; a `DataMap` (or an
+   * `EepromPageManager`) is responsible for assigning the real page via
+   * setPageNum() before this is used for storage. */
+  PageBackedData(addr_t recordId, GenericSpiEeprom &eeprom)
+      : data(), recordId(recordId), _pageNum(0), _eeprom(eeprom){};
+  PageBackedData(const T &initial, addr_t recordId, GenericSpiEeprom &eeprom)
+      : data(initial), recordId(recordId), _pageNum(0), _eeprom(eeprom){};
 
   /** PageBackedData always occupies exactly one hardware page. */
   size_t sizeInPages() const override { return 1; };
@@ -389,19 +412,19 @@ public:
   addr_t getRecordId() const override { return recordId; };
 
   /** The hardware page this record is currently stored at. */
-  addr_t getPageNum() const { return _pageNum; };
+  addr_t getPageNum() const override { return _pageNum; };
 
   /** Reassign the hardware page this record is stored at (e.g. when relocated
    * by a wear-leveling allocator). Does not move the stored data; call
    * store() afterward to write `data` to the new page. */
-  void setPageNum(addr_t newPageNum) { _pageNum = newPageNum; };
+  void setPageNum(addr_t newPageNum) override { _pageNum = newPageNum; };
 
   /**
    * Load the stored copy of `data` from the current page. Verifies the
    * CRC32 trailer; if it does not match, returns false and leaves `data`
    * unmodified.
    */
-  bool load() {
+  bool load() override {
     uint8_t buf[sizeof(T) + sizeof(uint32_t)];
     size_t n = _eeprom.read(buf, _pageNum * hwPageSizeBytes, sizeof(buf));
     if (n != sizeof(buf)) {
@@ -420,18 +443,38 @@ public:
 
   /**
    * Store `data` to the current page, along with a freshly computed CRC32
-   * trailer, in a single page-sized write transaction.
+   * trailer, in a single page-sized write transaction. Immediately reads the
+   * page back and confirms it matches what was written (both byte-for-byte
+   * and via CRC32), so a caller can detect a bad write/page instead of
+   * silently trusting it.
    *
-   * Returns the number of bytes written.
+   * Returns true iff the write was verified.
    */
-  size_t store() {
+  bool store() override {
     uint8_t buf[sizeof(T) + sizeof(uint32_t)];
     memcpy(buf, &data, sizeof(T));
 
     uint32_t crc = computeCrc32(buf, sizeof(T));
     memcpy(buf + sizeof(T), &crc, sizeof(uint32_t));
 
-    return _eeprom.write(buf, _pageNum * hwPageSizeBytes, sizeof(buf));
+    size_t written = _eeprom.write(buf, _pageNum * hwPageSizeBytes, sizeof(buf));
+    if (written != sizeof(buf)) {
+      return false;
+    }
+
+    uint8_t readBack[sizeof(T) + sizeof(uint32_t)];
+    size_t readCount =
+        _eeprom.read(readBack, _pageNum * hwPageSizeBytes, sizeof(readBack));
+    if (readCount != sizeof(readBack)) {
+      return false;
+    }
+    if (memcmp(buf, readBack, sizeof(readBack)) != 0) {
+      return false;
+    }
+
+    uint32_t readBackCrc;
+    memcpy(&readBackCrc, readBack + sizeof(T), sizeof(uint32_t));
+    return computeCrc32(readBack, sizeof(T)) == readBackCrc;
   };
 
   /** Local copy of the EEPROM-backed data. */
@@ -446,6 +489,347 @@ private:
 
   /** The EEPROM backing this data. */
   GenericSpiEeprom &_eeprom;
+};
+
+/**
+ * The fixed-format "superblock" persisted at hardware page 0 of an EEPROM
+ * managed by `EepromPageManager`. Verified via `PageBackedData`'s usual
+ * CRC32 trailer.
+ */
+struct EepromRootPageData {
+  /** Set to `EepromPageManager<...>::ROOT_PAGE_MAGIC` once formatted. */
+  uint32_t magic;
+
+  /** The on-disk layout version of the page-manager system itself (deadlist
+   * / usage list / data map placement), independent of the application's own
+   * record format. */
+  uint32_t systemVersion;
+
+  /** The application-supplied format version of the records stored above the
+   * system pages. Lets an application detect that it's looking at an EEPROM
+   * formatted by an incompatible build of itself. */
+  uint32_t appVersion;
+
+  /** Reserved for future use; always zero. */
+  uint8_t reserved[4];
+};
+
+/**
+ * Top-level coordinator for wear-leveled EEPROM storage.
+ *
+ * Lays out a fixed set of "system" pages at the start of the EEPROM:
+ *   - page 0: the root page (`EepromRootPageData`).
+ *   - page 1: the `WearLevelDeadList`.
+ *   - page 2: the `PageUsageBitmap` (free/used list).
+ *   - page 3..3+numMapPages-1: the `DataMap`.
+ * Application data for the supplied `DataMappable` records begins
+ * immediately after the data map (see `firstDataPageNum()`).
+ *
+ * @param bitSize the size of the EEPROM, in bits.
+ * @param hwPageSizeBytes the size of one write page for the EEPROM, in bytes.
+ */
+template <size_t bitSize, size_t hwPageSizeBytes> class EepromPageManager {
+  /** Total number of hardware pages in the managed EEPROM. */
+  static constexpr size_t _numPages = (bitSize / 8) / hwPageSizeBytes;
+
+  /**
+   * Number of hardware pages needed to serialize a single `EepromPageBitmap`
+   * (the deadlist or the usage list) covering all `_numPages` pages of this
+   * EEPROM. For a small EEPROM this is 1, but for a large one (e.g. 1 MiB at
+   * 64 bytes/page -> 16384 pages -> a 2048-byte bitmap) it can be several
+   * pages. The deadlist and usage list are always the same size as each
+   * other, since both cover the same `_numPages`.
+   */
+  static constexpr size_t _bitmapTableSizeBytes = (_numPages + 7) / 8;
+  static constexpr size_t _bitmapNumPages =
+      (_bitmapTableSizeBytes + hwPageSizeBytes - 1) / hwPageSizeBytes;
+
+public:
+  using addr_t = uint16_t;
+
+  /**
+   * The hardware page number at which each system structure is rooted. The
+   * deadlist and usage list placements account for either bitmap spanning
+   * more than one hardware page; the data map always immediately follows
+   * the usage list.
+   */
+  static constexpr size_t ROOT_PAGE_NUM = 0;
+  static constexpr size_t DEAD_LIST_PAGE_NUM = ROOT_PAGE_NUM + 1;
+  static constexpr size_t USAGE_LIST_PAGE_NUM = DEAD_LIST_PAGE_NUM + _bitmapNumPages;
+  static constexpr size_t DATA_MAP_START_PAGE_NUM = USAGE_LIST_PAGE_NUM + _bitmapNumPages;
+
+  /** Magic number proving the root page has been formatted by this system. */
+  static constexpr uint32_t ROOT_PAGE_MAGIC = 0x0571AC94;
+
+  /** The page-manager system's own on-disk format version. */
+  static constexpr uint32_t SYSTEM_FORMAT_VERSION = 1;
+
+  /** How long (in ms) a single `storeRecord()` write+readback may take before
+   * it's treated as a stalled/failed write, prompting relocation. The M95256
+   * datasheet specifies a 5ms max write time; this allows generous margin. */
+  static constexpr unsigned long WRITE_STALL_THRESHOLD_MILLIS = 20;
+
+  /** Root page is valid: magic, system version, and app version all check out. */
+  static constexpr int ROOT_PAGE_OK = 0;
+  /** The root page failed to load (read error or CRC32 mismatch) -- the
+   * EEPROM has likely never been formatted, or is corrupt. */
+  static constexpr int ROOT_PAGE_ERR_LOAD_FAILED = -1;
+  /** The root page loaded cleanly but its magic number doesn't match -- this
+   * EEPROM was never formatted by an EepromPageManager. */
+  static constexpr int ROOT_PAGE_ERR_BAD_MAGIC = -2;
+  /** The root page's system format version isn't one this build understands. */
+  static constexpr int ROOT_PAGE_ERR_BAD_SYSTEM_VERSION = -3;
+  /** The root page's application format version doesn't match what the
+   * application asked for in its EepromPageManager constructor. */
+  static constexpr int ROOT_PAGE_ERR_BAD_APP_VERSION = -4;
+  /** The data map failed to load (CRC32 mismatch on one or more of its pages). */
+  static constexpr int ERR_DATA_MAP_CORRUPT = -5;
+
+  /**
+   * Create a page manager for `numRecords` `DataMappable` records, backed by
+   * `eeprom`. `appFormatVersion` is the application's own data format
+   * version, persisted to (and checked against) the root page.
+   */
+  EepromPageManager(GenericSpiEeprom &eeprom, DataMappable *const *records,
+                     size_t numRecords, uint32_t appFormatVersion)
+      : _eeprom(eeprom),
+        _deadList(eeprom, DEAD_LIST_PAGE_NUM * hwPageSizeBytes),
+        _usage(eeprom, USAGE_LIST_PAGE_NUM * hwPageSizeBytes),
+        _dataMap(eeprom, DATA_MAP_START_PAGE_NUM, records, numRecords),
+        _rootPage(/*recordId=*/0, eeprom), _records(records),
+        _numRecords(numRecords), _appFormatVersion(appFormatVersion),
+        _firstDataPageNum(DATA_MAP_START_PAGE_NUM + _dataMap.numMapPages()){};
+
+  /**
+   * Format a brand-new EEPROM: writes the root page, formats the deadlist
+   * and usage list, reserves the system pages (root/deadlist/usage/map) as
+   * in-use, and assigns each known `DataMappable` an initial run of free
+   * pages (sized via `sizeInPages()`), recording the assignment in both the
+   * usage list and the data map.
+   *
+   * Returns false if there isn't enough free space to place every record
+   * (records placed before the failure remain assigned).
+   */
+  bool formatNew() {
+    _deadList.formatNew();
+    _usage.formatNew();
+
+    for (size_t p = 0; p < _firstDataPageNum; p++) {
+      _usage.markPageInUse(p);
+    }
+
+    _rootPage.data.magic = ROOT_PAGE_MAGIC;
+    _rootPage.data.systemVersion = SYSTEM_FORMAT_VERSION;
+    _rootPage.data.appVersion = _appFormatVersion;
+    memset(_rootPage.data.reserved, 0, sizeof(_rootPage.data.reserved));
+    _rootPage.store();
+
+    size_t nextSearch = _firstDataPageNum;
+    for (size_t i = 0; i < _numRecords; i++) {
+      DataMappable *record = _records[i];
+      size_t numPages = record->sizeInPages();
+      size_t startPage = _findFreePageRun(nextSearch, numPages);
+      if (startPage == ERR_NO_FREE_PAGES) {
+        return false;
+      }
+
+      for (size_t j = 0; j < numPages; j++) {
+        _usage.markPageInUse(startPage + j);
+      }
+
+      _dataMap.setStartPage(record->getRecordId(), static_cast<addr_t>(startPage));
+      record->setPageNum(static_cast<addr_t>(startPage));
+      nextSearch = startPage + numPages;
+    }
+    _dataMap.flush();
+    return true;
+  };
+
+  /**
+   * Load the root page, deadlist, usage list, and data map from the EEPROM.
+   * Does *not* load any individual record's data -- callers are responsible
+   * for calling load() on whichever records they actually need.
+   *
+   * Updates each known `DataMappable`'s cached page number from the freshly
+   * loaded data map.
+   *
+   * Returns ROOT_PAGE_OK on success, or the first applicable
+   * ROOT_PAGE_ERR_... / ERR_DATA_MAP_CORRUPT code otherwise.
+   */
+  int init() {
+    int rootStatus = checkRootPageValid();
+    if (rootStatus != ROOT_PAGE_OK) {
+      return rootStatus;
+    }
+
+    _deadList.init();
+    _usage.init();
+    if (!_dataMap.init()) {
+      return ERR_DATA_MAP_CORRUPT;
+    }
+
+    for (size_t i = 0; i < _numRecords; i++) {
+      _records[i]->setPageNum(_dataMap.getStartPage(_records[i]->getRecordId()));
+    }
+
+    return ROOT_PAGE_OK;
+  };
+
+  /**
+   * Load the root page and confirm it is valid: readable (CRC32-clean), has
+   * the expected magic number, and matches both the system and
+   * application-level format versions this manager expects.
+   *
+   * Returns ROOT_PAGE_OK, or the first applicable ROOT_PAGE_ERR_* code.
+   */
+  int checkRootPageValid() {
+    if (!_rootPage.load()) {
+      return ROOT_PAGE_ERR_LOAD_FAILED;
+    }
+    if (_rootPage.data.magic != ROOT_PAGE_MAGIC) {
+      return ROOT_PAGE_ERR_BAD_MAGIC;
+    }
+    if (_rootPage.data.systemVersion != SYSTEM_FORMAT_VERSION) {
+      return ROOT_PAGE_ERR_BAD_SYSTEM_VERSION;
+    }
+    if (_rootPage.data.appVersion != _appFormatVersion) {
+      return ROOT_PAGE_ERR_BAD_APP_VERSION;
+    }
+    return ROOT_PAGE_OK;
+  };
+
+  /**
+   * Persist `record` to its currently assigned page(s).
+   *
+   * If the write cannot be verified -- either store() reports a readback
+   * mismatch, or the operation took implausibly long
+   * (> WRITE_STALL_THRESHOLD_MILLIS, well past the device's rated max write
+   * time) -- the old page(s) are marked dead in the deadlist and freed in
+   * the usage list, a fresh run of live, free pages is chosen by consulting
+   * the usage list and deadlist, the data map and usage list are updated and
+   * flushed, and the record is written again at its new home.
+   *
+   * Returns true iff `record` ends up durably (and verifiably) stored
+   * somewhere.
+   */
+  bool storeRecord(DataMappable &record) {
+    unsigned long startMillis = millis();
+    bool ok = record.store();
+    unsigned long elapsedMillis = millis() - startMillis;
+
+    if (ok && elapsedMillis <= WRITE_STALL_THRESHOLD_MILLIS) {
+      return true;
+    }
+
+    return _relocateAndStore(record);
+  };
+
+  /** Direct access to the deadlist, e.g. for tests or diagnostics. */
+  WearLevelDeadList<bitSize, hwPageSizeBytes> &deadList() { return _deadList; };
+
+  /** Direct access to the usage (free/used) list, e.g. for tests or
+   * diagnostics. */
+  PageUsageBitmap<bitSize, hwPageSizeBytes> &usage() { return _usage; };
+
+  /** Direct access to the data map, e.g. for tests or diagnostics. */
+  DataMap<hwPageSizeBytes> &dataMap() { return _dataMap; };
+
+  /** The first hardware page available for application data; everything
+   * before this is reserved for the root page, deadlist, usage list, and
+   * data map. */
+  size_t firstDataPageNum() const { return _firstDataPageNum; };
+
+private:
+  /**
+   * Find the first run of `numPages` consecutive pages, at or after
+   * `startPageNum`, that are all simultaneously free (per the usage list)
+   * and live (per the deadlist), without running off the end of the
+   * EEPROM. Returns ERR_NO_FREE_PAGES if no such run exists.
+   */
+  size_t _findFreePageRun(size_t startPageNum, size_t numPages) {
+    size_t candidate = startPageNum;
+    while (true) {
+      candidate = _usage.findNextFreePageNum(candidate);
+      if (candidate == ERR_NO_FREE_PAGES) {
+        return ERR_NO_FREE_PAGES;
+      }
+
+      size_t j = 0;
+      for (; j < numPages; j++) {
+        size_t p = candidate + j;
+        if (p >= _numPages || _usage.isPageInUse(p) || _deadList.isPageDead(p)) {
+          break;
+        }
+      }
+
+      if (j == numPages) {
+        return candidate;
+      }
+
+      // The run starting at `candidate` is blocked at offset `j` (either off
+      // the end of the EEPROM, already in-use, or dead). Resume the search
+      // just past the blocking page.
+      candidate = candidate + j + 1;
+    }
+  };
+
+  /**
+   * Relocate `record` to a fresh run of pages after a failed store(), then
+   * retry the write at the new location.
+   */
+  bool _relocateAndStore(DataMappable &record) {
+    size_t numPages = record.sizeInPages();
+    addr_t oldPageNum = record.getPageNum();
+
+    for (size_t j = 0; j < numPages; j++) {
+      _deadList.markPageDead(oldPageNum + j);
+      _usage.markPageFree(oldPageNum + j);
+    }
+
+    size_t newPageNum = _findFreePageRun(_firstDataPageNum, numPages);
+    if (newPageNum == ERR_NO_FREE_PAGES) {
+      return false;
+    }
+
+    for (size_t j = 0; j < numPages; j++) {
+      _usage.markPageInUse(newPageNum + j);
+    }
+
+    record.setPageNum(static_cast<addr_t>(newPageNum));
+    _dataMap.setStartPage(record.getRecordId(), static_cast<addr_t>(newPageNum));
+    _dataMap.flush();
+
+    return record.store();
+  };
+
+  /** The EEPROM this page manager governs. */
+  GenericSpiEeprom &_eeprom;
+
+  /** Tracks pages that have failed a verified write and must never be
+   * allocated again. */
+  WearLevelDeadList<bitSize, hwPageSizeBytes> _deadList;
+
+  /** Tracks which pages currently hold live data. */
+  PageUsageBitmap<bitSize, hwPageSizeBytes> _usage;
+
+  /** Tracks the current start page of every known record. */
+  DataMap<hwPageSizeBytes> _dataMap;
+
+  /** The fixed-location (page 0) superblock. */
+  PageBackedData<EepromRootPageData, hwPageSizeBytes> _rootPage;
+
+  /** The records this page manager is responsible for placing/relocating. */
+  DataMappable *const *_records;
+
+  /** Number of records in `_records`. */
+  const size_t _numRecords;
+
+  /** The application's own data format version, checked against the root
+   * page on init(). */
+  const uint32_t _appFormatVersion;
+
+  /** First hardware page available for application data. */
+  const size_t _firstDataPageNum;
 };
 
 #endif /* _EEPROM_WEAR_LEVEL_H */

@@ -21,9 +21,14 @@ public:
   explicit DummyRecord(addr_t id) : _id(id) {}
   size_t sizeInPages() const override { return 1; }
   addr_t getRecordId() const override { return _id; }
+  addr_t getPageNum() const override { return _pageNum; }
+  void setPageNum(addr_t newPageNum) override { _pageNum = newPageNum; }
+  bool load() override { return true; }
+  bool store() override { return true; }
 
 private:
   addr_t _id;
+  addr_t _pageNum = 0;
 };
 
 // Build `count` DummyRecord objects with ids 0..count-1, and a pointer array

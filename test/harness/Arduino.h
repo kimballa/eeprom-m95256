@@ -40,6 +40,18 @@ inline void digitalWrite(int /*pin*/, int level) {
 inline void delayMicroseconds(unsigned int) {}
 inline void delayNanoseconds(unsigned int) {}
 
+// A test-controllable stand-in for Arduino's millis(). Tests that need to
+// simulate a stalled EEPROM write advance this via advanceFakeMillis() (see
+// FakeEeprom::setWriteDelayMillis() in fake_eeprom.h) rather than via a real
+// sleep.
+inline unsigned long &_fakeMillisCounter() {
+  static unsigned long t = 0;
+  return t;
+}
+inline unsigned long millis() { return _fakeMillisCounter(); }
+inline void advanceFakeMillis(unsigned long ms) { _fakeMillisCounter() += ms; }
+inline void resetFakeMillis() { _fakeMillisCounter() = 0; }
+
 template <typename T> constexpr T min(T a, T b) { return a < b ? a : b; }
 template <typename T> constexpr T max(T a, T b) { return a > b ? a : b; }
 
