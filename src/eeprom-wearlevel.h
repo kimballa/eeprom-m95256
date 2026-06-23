@@ -60,6 +60,24 @@ inline uint32_t computeCrc32(const uint8_t *data, size_t len) {
  * last durable copy) is never touched during the write, which is what makes a
  * mid-write power loss recoverable.
  *
+ * Worked example, a 3-page table. formatBoth() writes both slots of every page
+ * and marks slot A active throughout, so the live composite reads A,A,A:
+ *
+ *     page:      0     1     2
+ *     copy A:  [v0*] [v1*] [v2*]      (* = active slot, the one load() reads)
+ *     copy B:  [v0 ] [v1 ] [v2 ]
+ *
+ * Now update only the middle page (page 1 -> v1'). Its inactive slot is B, so
+ * v1' is written there and page 1's active pointer flips to B; pages 0 and 2
+ * are untouched. The live composite now reads A,B,A:
+ *
+ *     copy A:  [v0*] [v1 ] [v2*]      (page 1's copy A is now its stale backup)
+ *     copy B:  [v0 ] [v1'*] [v2 ]
+ *
+ * A crash midway through writing v1' just leaves the old v1 in copy A still
+ * active and valid. The next update of page 1 would write back to slot A,
+ * returning to A,A,A -- each page ping-pongs between its two slots.
+ *
  * @param hwPageSizeBytes the size of one write page for the EEPROM, in bytes.
  */
 template <size_t hwPageSizeBytes> class RedundantPagedStore {
