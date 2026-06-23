@@ -34,6 +34,26 @@ public:
   }
 
   size_t write(void *buf, addr_t addr, size_t count) override {
+    // Once the simulated power has been lost, the device is dead: no further
+    // bytes ever reach the array, just as on a real MCU whose CPU has stopped.
+    if (_poweredOff) {
+      return 0;
+    }
+
+    _writeCount++;
+
+    if (_powerLossArmed && _writeCount == _powerLossAtWrite) {
+      // Simulate losing power partway through this page program: only the
+      // first `_powerLossPartialBytes` bytes of this write durably land (0 for
+      // a clean inter-write boundary, a fraction for a torn page), and every
+      // subsequent write is a no-op. Reads still return whatever committed.
+      size_t avail = available(addr, count);
+      size_t partial = std::min(_powerLossPartialBytes, avail);
+      memcpy(_data.data() + addr, buf, partial);
+      _poweredOff = true;
+      return partial;
+    }
+
     size_t avail = available(addr, count);
     memcpy(_data.data() + addr, buf, avail);
     if (_faultyByteSet && _faultyByte >= addr && _faultyByte < addr + avail) {
@@ -48,6 +68,24 @@ public:
 
   size_t size() const { return _data.size(); }
   uint8_t &byteAt(size_t i) { return _data.at(i); }
+
+  /** Number of write() calls seen so far (each is a single page-level write
+   * for the higher-level structures). Tests use this to enumerate every
+   * possible interruption point of a multi-write operation. */
+  size_t writeCount() const { return _writeCount; }
+  void resetWriteCount() { _writeCount = 0; }
+
+  /** Arm a simulated power loss: the `atWrite`-th subsequent write() call
+   * (1-based) persists only its first `partialBytes` bytes, after which the
+   * device is dead and all further writes are no-ops. `partialBytes == 0`
+   * models power lost cleanly between two page writes; a value in
+   * (0, pageSize) models a torn page program whose CRC will fail. */
+  void armPowerLoss(size_t atWrite, size_t partialBytes = 0) {
+    _powerLossArmed = true;
+    _powerLossAtWrite = atWrite;
+    _powerLossPartialBytes = partialBytes;
+  }
+  bool poweredOff() const { return _poweredOff; }
 
   void zeroAll() { std::fill(_data.begin(), _data.end(), 0); }
 
@@ -78,6 +116,12 @@ private:
   unsigned long _writeDelayMillis = 0;
   addr_t _faultyByte = 0;
   bool _faultyByteSet = false;
+
+  size_t _writeCount = 0;
+  bool _powerLossArmed = false;
+  size_t _powerLossAtWrite = 0;
+  size_t _powerLossPartialBytes = 0;
+  bool _poweredOff = false;
 };
 
 #endif /* _FAKE_EEPROM_H */
