@@ -1,0 +1,29 @@
+{
+  "files.associations": {
+    "*.py": "python",
+    "algorithm": "cpp",
+    "printf.h": "c",
+    "functional": "cpp",
+    "core_pins.h": "c",
+    "pgmspace.h": "c",
+    "inttypes.h": "c",
+    "imxrt.h": "c",
+    "stdint.h": "c",
+    "stdint-gcc.h": "c"
+  },
+  "editor.defaultFormatter": "xaver.clang-format",
+  "arduino.useArduinoCli": true,
+  "editor.tabSize": 2,
+  "editor.formatOnSave": true,
+  "vim.textwidth": 100,
+  "editor.wordWrapColumn": 100,
+  "clang-format.assumeFilename": "${workspaceRoot}/.clang_format",
+  "prettier.enable": false,
+  "C_Cpp.default.compilerPath": "/home/aaron/.arduino15/packages/teensy/tools/teensy-compile/11.3.1/arm/bin/arm-none-eabi-gcc",
+  "C_Cpp.default.cppStandard": "gnu++20",
+  "C_Cpp.default.intelliSenseMode": "linux-gcc-arm",
+  "makefile.configureOnOpen": true,
+  "files.exclude": {
+    "**/*.o": true
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(xargs -I{} echo {})",
+      "Bash(sed -i 's/addr_t sp = dataMap.getStartPage\\(0\\);/DataMap<64>::addr_t sp = dataMap.getStartPage\\(0\\);/' test_main.cpp)",
+      "Bash(g++ -std=gnu++20 -Wall -Wextra -I. -I/home/aaron/src/arduino/eeprom-m95256/src test_main.cpp -o test_main)",
+      "Bash(/tmp/claude-1000/-home-aaron-src-arduino-eeprom-m95256/cf9ce4cf-358d-42ba-96b0-6f83c317ffd8/scratchpad/stub/test_main)",
+      "Bash(find / -maxdepth 4 -iname \"arduino-makefile\")",
+      "Bash(find / -maxdepth 6 -iname \"arduino.mk\")",
+      "Bash(ls -la /home/aaron/src/arduino/eeprom-m95256/test/harness; echo ---; head -50 /home/aaron/src/arduino/eeprom-m95256/test/doctest.h; echo ---; wc -l /home/aaron/src/arduino/eeprom-m95256/test/doctest.h; echo ---MK---; grep -n \"^test\\\\|: test\\\\|PHONY\\\\|^all\" /home/aaron/src/arduino/arduino-makefile/arduino.mk | head -50)",
+      "Read(//home/aaron/src/arduino/arduino-makefile/**)"
+    ]
+  }
+}
