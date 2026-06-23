@@ -127,7 +127,7 @@ TEST_CASE("formatNew() returns false when there isn't enough free space for ever
 }
 
 TEST_CASE("checkRootPageValid()/init() report ROOT_PAGE_ERR_LOAD_FAILED on a "
-          "never-formatted (all-zero) EEPROM") {
+          "never-formatted (factory-reset, all-0xFF) EEPROM") {
   constexpr size_t kNumPages = kFirstDataPageNum + 2;
   FakeEeprom eeprom(kNumPages * kPageSize);
   RecordSet recs(eeprom, 2);

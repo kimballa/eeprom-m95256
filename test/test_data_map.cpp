@@ -107,8 +107,9 @@ TEST_CASE("a record count that exactly fills one chunk page uses exactly one pag
   map.flush();
 
   // Byte just past the single page's data+CRC region must be untouched
-  // (still zero), confirming the write didn't spill into a second page.
-  CHECK(eeprom.byteAt(kPageSize) == 0);
+  // (still factory-reset 0xFF), confirming the write didn't spill into a
+  // second page.
+  CHECK(eeprom.byteAt(kPageSize) == 0xFF);
 
   RecordSet reloadRecs(kRecordsPerPage);
   DataMap<kPageSize> reloaded(eeprom, 0, reloadRecs.ptrs.data(), reloadRecs.ptrs.size());

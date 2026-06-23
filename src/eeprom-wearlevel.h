@@ -87,6 +87,24 @@ private:
 };
 
 /**
+ * Minimal interface a deadlist must expose for a `WearLevelingPageData<T,
+ * hwPageSizeBytes, k>` ring to consult and update, without needing to know
+ * the enclosing EEPROM's total `bitSize` (and thus without becoming a
+ * template parameter of `WearLevelingPageData` itself).
+ */
+class DeadPageOracle {
+public:
+  virtual ~DeadPageOracle() = default;
+
+  /** Return true if the page identified by pageNum is marked dead and should
+   * not be used for storage. */
+  virtual bool isPageDead(size_t pageNum) const = 0;
+
+  /** Mark the specified page as no longer accessible. */
+  virtual void markPageDead(size_t pageNum) = 0;
+};
+
+/**
  * A bitmap indicating which pages are *dead*.
  *
  * Each bit in this array represents one page in the EEPROM. A zero in bit
@@ -98,7 +116,8 @@ private:
  * @param hwPageSizeBytes the size of one write page for the EEPROM, in bytes.
  */
 template <size_t bitSize, size_t hwPageSizeBytes>
-class WearLevelDeadList : public EepromPageBitmap<bitSize, hwPageSizeBytes> {
+class WearLevelDeadList : public EepromPageBitmap<bitSize, hwPageSizeBytes>,
+                          public DeadPageOracle {
   using Base = EepromPageBitmap<bitSize, hwPageSizeBytes>;
 
 public:
@@ -112,12 +131,12 @@ public:
 
   /** Return true if the page identified by pageNum is marked dead and should
    * not be used for storage. */
-  bool isPageDead(size_t pageNum) const { return Base::isPageSet(pageNum); }
+  bool isPageDead(size_t pageNum) const override { return Base::isPageSet(pageNum); }
 
   bool isPageLive(size_t pageNum) const { return !Base::isPageSet(pageNum); };
 
   /** Mark the specified page as no longer accessible. */
-  void markPageDead(size_t pageNum) { Base::setPageBit(pageNum); };
+  void markPageDead(size_t pageNum) override { Base::setPageBit(pageNum); };
 };
 
 constexpr size_t ERR_NO_FREE_PAGES = SIZE_MAX;
@@ -489,6 +508,342 @@ private:
 
   /** The EEPROM backing this data. */
   GenericSpiEeprom &_eeprom;
+};
+
+/**
+ * A container for a fixed-size data element `T`, proactively wear-leveled
+ * across a small ring of `k` hardware pages, for data that's written far
+ * more often than ordinary `PageBackedData<T>` records can tolerate.
+ *
+ * `T`'s home is a contiguous run of `k` hardware pages (`sizeInPages()==k`),
+ * assigned as a single block by an `EepromPageManager`/`DataMap` exactly as
+ * for any other `DataMappable`. Each `store()` call writes to the *next*
+ * page in the ring rather than overwriting the same page every time, so no
+ * single physical page absorbs more than 1/k of the total write traffic.
+ *
+ * Each ring slot's hardware page holds:
+ *   [writeSequenceId: uint32_t][T][CRC32 of the above]
+ * The writeSequenceId increments by one on every store() (wrapping from
+ * UINT32_MAX back to 1, never to 0, since 0 is never written and thus can't
+ * collide with a legitimately-stored value). On load(), every slot is read
+ * and CRC-checked; the most-recently-written *valid* slot is identified as
+ * the one with the largest writeSequenceId -- except where that would be
+ * ambiguous because the counter has wrapped partway around the ring (some
+ * slots still hold large pre-wrap values, others already hold small
+ * post-wrap values): that case is detected by seeing literal UINT32_MAX
+ * among the candidates alongside another candidate well below it (more than
+ * `k` less), and resolved by considering only candidates whose
+ * writeSequenceId is `<= k` (which, by construction, is exactly the set of
+ * slots already written since the wrap).
+ *
+ * If a slot fails its post-write readback verification, it is marked dead
+ * in the supplied `DeadPageOracle` (typically an `EepromPageManager`'s
+ * `WearLevelDeadList`) and skipped from then on; store() tries the next live
+ * slot in the ring instead of failing outright. If marking a slot dead would
+ * bring the ring to half (or more) dead slots, this ring is considered worn
+ * out: store() returns false without writing anywhere, signaling the caller
+ * (e.g. `EepromPageManager::storeRecord()`) to relocate this record's
+ * `sizeInPages()`-page block entirely, the same way it would for any other
+ * `DataMappable` whose write failed.
+ *
+ * @param T the fixed-size data element to store.
+ * @param hwPageSizeBytes the size of one write page for the EEPROM, in bytes.
+ * @param k the number of hardware pages in the round-robin ring. Defaults to
+ *   16; larger values spread writes (and thus wear) more thinly but cost
+ *   more EEPROM space and a longer worst-case load()/store() scan.
+ */
+template <typename T, size_t hwPageSizeBytes, size_t k = 16>
+class WearLevelingPageData : public DataMappable {
+  static_assert(k >= 1, "k must be at least 1.");
+  static_assert(2 * sizeof(uint32_t) + sizeof(T) <= hwPageSizeBytes,
+                "writeSequenceId + T + its CRC32 trailer must fit within one "
+                "hardware page.");
+
+public:
+  using addr_t = uint16_t;
+
+  /** Number of hardware pages in the round-robin ring. */
+  static constexpr size_t NUM_SLOTS = k;
+
+  /** The ring's base page starts out zeroed, and the ring starts out with no
+   * known valid record (as if freshly formatted); a `DataMap` (or an
+   * `EepromPageManager`) is responsible for assigning the real base page via
+   * setPageNum() before this is used for storage, and load() is responsible
+   * for discovering whatever the most recently written slot actually is.
+   *
+   * The deadlist isn't taken here, but via setDeadPageOracle(): an
+   * `EepromPageManager`'s deadlist doesn't exist until the manager itself is
+   * constructed, but this object must already exist (so its address can go
+   * into the manager's `records` array) *before* that constructor runs.
+   * Until setDeadPageOracle() is called, this ring behaves as if it has no
+   * dead slots. */
+  WearLevelingPageData(addr_t recordId, GenericSpiEeprom &eeprom)
+      : data(), recordId(recordId), _basePage(0), _currentSlot(0), _currentSeq(0),
+        _eeprom(eeprom), _deadList(nullptr){};
+  WearLevelingPageData(const T &initial, addr_t recordId, GenericSpiEeprom &eeprom)
+      : data(initial), recordId(recordId), _basePage(0), _currentSlot(0), _currentSeq(0),
+        _eeprom(eeprom), _deadList(nullptr){};
+
+  /** A WearLevelingPageData record occupies its entire ring of `k` pages. */
+  size_t sizeInPages() const override { return k; };
+
+  /** This record's unique id within its DataMap. */
+  addr_t getRecordId() const override { return recordId; };
+
+  /** Bind (or rebind) the deadlist this ring consults before writing to a
+   * slot, and updates when a slot's write fails verification. Typically
+   * called once, right after constructing the `EepromPageManager` that owns
+   * the deadlist (see the constructor comment for why this can't happen at
+   * construction time instead). */
+  void setDeadPageOracle(DeadPageOracle &deadList) { _deadList = &deadList; };
+
+  /** The base hardware page of the ring (i.e. its first of `k` pages). */
+  addr_t getPageNum() const override { return _basePage; };
+
+  /** Reassign the ring's base page (e.g. when relocated wholesale by
+   * `EepromPageManager::storeRecord()` after too many of this ring's slots
+   * went dead). Forgets any previously known slot/sequence, since a new
+   * ring's history starts fresh; call store() afterward to write `data`
+   * there for the first time. */
+  void setPageNum(addr_t newBasePage) override {
+    _basePage = newBasePage;
+    _currentSlot = 0;
+    _currentSeq = 0;
+  };
+
+  /** Which of the `k` slots currently holds the most-recently-written data,
+   * per the last successful load() or store(). Meaningless until one of
+   * those has succeeded at least once. */
+  size_t currentSlot() const { return _currentSlot; };
+
+  /** The hardware page backing `currentSlot()`. */
+  addr_t currentPageNum() const { return static_cast<addr_t>(_basePage + _currentSlot); };
+
+  /** The writeSequenceId last read (via load()) or written (via store())
+   * into the current slot, or 0 if no valid record has been found yet. */
+  uint32_t currentWriteSeqId() const { return _currentSeq; };
+
+  /**
+   * Scan every slot in the ring, identify the most recently written valid
+   * one (per the writeSequenceId/wraparound rules described above), and load
+   * `data` from it.
+   *
+   * Returns false (leaving `data` unmodified, and forgetting any previously
+   * known slot/sequence) if no slot in the ring holds a CRC-valid record --
+   * e.g. a never-yet-written ring.
+   */
+  bool load() override {
+    uint32_t rawSeq[k];
+    bool validSlot[k];
+    bool sawMax = false;
+    bool sawLow = false;
+
+    for (size_t i = 0; i < k; i++) {
+      uint8_t buf[_slotSize];
+      validSlot[i] = _readSlot(i, buf) && _crcValid(buf);
+      if (!validSlot[i]) {
+        continue;
+      }
+
+      memcpy(&rawSeq[i], buf, sizeof(uint32_t));
+      if (rawSeq[i] == UINT32_MAX) {
+        sawMax = true;
+      }
+      if (rawSeq[i] < UINT32_MAX - k) {
+        sawLow = true;
+      }
+    }
+
+    bool wrapped = sawMax && sawLow;
+    bool found = false;
+    size_t bestSlot = 0;
+    uint32_t bestSeq = 0;
+
+    for (size_t i = 0; i < k; i++) {
+      if (!validSlot[i] || (wrapped && rawSeq[i] > k)) {
+        continue;
+      }
+      if (!found || rawSeq[i] > bestSeq) {
+        found = true;
+        bestSeq = rawSeq[i];
+        bestSlot = i;
+      }
+    }
+
+    if (!found && wrapped) {
+      // Defensive fallback: the wrap heuristic excluded every candidate,
+      // which shouldn't happen for a ring written only by this class.
+      // Reconsider without the restriction rather than reporting failure.
+      for (size_t i = 0; i < k; i++) {
+        if (!validSlot[i]) {
+          continue;
+        }
+        if (!found || rawSeq[i] > bestSeq) {
+          found = true;
+          bestSeq = rawSeq[i];
+          bestSlot = i;
+        }
+      }
+    }
+
+    if (!found) {
+      _currentSeq = 0;
+      return false;
+    }
+
+    uint8_t buf[_slotSize];
+    _readSlot(bestSlot, buf);
+    memcpy(&data, buf + sizeof(uint32_t), sizeof(T));
+
+    _currentSlot = bestSlot;
+    _currentSeq = bestSeq;
+    return true;
+  };
+
+  /**
+   * Write `data` to the next slot in the round-robin ring (the live slot
+   * after `currentSlot()`, or slot 0 if no valid record is known yet), with
+   * a freshly incremented writeSequenceId and CRC32 trailer, then read it
+   * back to verify the write.
+   *
+   * If that slot's write can't be verified, it is marked dead and the next
+   * live slot is tried instead, continuing around the ring. Returns false,
+   * without writing anywhere, if half or more of the ring's slots are
+   * already dead (this ring is considered worn out -- the caller should
+   * relocate this record to a fresh ring elsewhere) or if every remaining
+   * live slot's write fails verification.
+   */
+  bool store() override {
+    if (_deadSlotCount() * 2 >= k) {
+      return false;
+    }
+
+    uint32_t nextSeq;
+    size_t startSlot;
+    if (_currentSeq == 0) {
+      nextSeq = 1;
+      startSlot = 0;
+    } else {
+      nextSeq = (_currentSeq == UINT32_MAX) ? 1 : _currentSeq + 1;
+      startSlot = (_currentSlot + 1) % k;
+    }
+
+    for (size_t attempt = 0; attempt < k; attempt++) {
+      size_t slot = (startSlot + attempt) % k;
+      if (_deadList != nullptr && _deadList->isPageDead(_basePage + slot)) {
+        continue;
+      }
+
+      if (_writeSlot(slot, nextSeq)) {
+        _currentSlot = slot;
+        _currentSeq = nextSeq;
+        return true;
+      }
+
+      if (_deadList != nullptr) {
+        _deadList->markPageDead(_basePage + slot);
+        if (_deadSlotCount() * 2 >= k) {
+          return false;
+        }
+      }
+    }
+
+    return false;
+  };
+
+  /** Local copy of the EEPROM-backed data. */
+  T data;
+
+  /** This record's unique id within its DataMap. */
+  const addr_t recordId;
+
+private:
+  /** Bytes occupied by one ring slot: writeSequenceId + T + CRC32. */
+  static constexpr size_t _slotSize = 2 * sizeof(uint32_t) + sizeof(T);
+
+  /** Byte address of the `slot`'th hardware page in the ring. */
+  addr_t _pageAddr(size_t slot) const {
+    return static_cast<addr_t>((_basePage + slot) * hwPageSizeBytes);
+  };
+
+  /** Number of this ring's `k` slots currently marked dead. Always 0 until
+   * setDeadPageOracle() has been called. */
+  size_t _deadSlotCount() const {
+    if (_deadList == nullptr) {
+      return 0;
+    }
+    size_t count = 0;
+    for (size_t i = 0; i < k; i++) {
+      if (_deadList->isPageDead(_basePage + i)) {
+        count++;
+      }
+    }
+    return count;
+  };
+
+  /** Read slot `i`'s raw bytes (writeSequenceId + T + CRC32) into `buf`.
+   * Returns false if the read was short. */
+  bool _readSlot(size_t i, uint8_t buf[_slotSize]) const {
+    return _eeprom.read(buf, _pageAddr(i), _slotSize) == _slotSize;
+  };
+
+  /** Returns true iff `buf` (a full slot read via `_readSlot()`) has a
+   * CRC32 trailer matching its writeSequenceId+T payload. */
+  static bool _crcValid(const uint8_t buf[_slotSize]) {
+    uint32_t storedCrc;
+    memcpy(&storedCrc, buf + sizeof(uint32_t) + sizeof(T), sizeof(uint32_t));
+    return computeCrc32(buf, sizeof(uint32_t) + sizeof(T)) == storedCrc;
+  };
+
+  /**
+   * Write `data` (tagged with `seq`) to ring slot `slot`, then read it back
+   * and confirm it matches byte-for-byte and via CRC32, exactly as
+   * `PageBackedData::store()` does for its single page.
+   */
+  bool _writeSlot(size_t slot, uint32_t seq) {
+    uint8_t buf[_slotSize];
+    memcpy(buf, &seq, sizeof(seq));
+    memcpy(buf + sizeof(seq), &data, sizeof(T));
+
+    uint32_t crc = computeCrc32(buf, sizeof(seq) + sizeof(T));
+    memcpy(buf + sizeof(seq) + sizeof(T), &crc, sizeof(crc));
+
+    addr_t pageAddr = _pageAddr(slot);
+    size_t written = _eeprom.write(buf, pageAddr, _slotSize);
+    if (written != _slotSize) {
+      return false;
+    }
+
+    uint8_t readBack[_slotSize];
+    if (!_readSlot(slot, readBack)) {
+      return false;
+    }
+    if (memcmp(buf, readBack, _slotSize) != 0) {
+      return false;
+    }
+
+    return _crcValid(readBack);
+  };
+
+  /** The base hardware page of the ring; the ring spans
+   * `[_basePage, _basePage + k)`. */
+  addr_t _basePage;
+
+  /** Which slot (offset from `_basePage`) currently holds the
+   * most-recently-written data, per the last load()/store(). */
+  size_t _currentSlot;
+
+  /** The writeSequenceId of `_currentSlot`'s data, or 0 if no valid record
+   * has been found/written yet (in which case the next store() starts the
+   * ring over at slot 0, sequence 1). */
+  uint32_t _currentSeq;
+
+  /** The EEPROM backing this ring. */
+  GenericSpiEeprom &_eeprom;
+
+  /** Where dead slots are recorded, and consulted to skip them. Null until
+   * setDeadPageOracle() is called. */
+  DeadPageOracle *_deadList;
 };
 
 /**

@@ -21,7 +21,11 @@
 
 class FakeEeprom : public GenericSpiEeprom {
 public:
-  explicit FakeEeprom(size_t sizeBytes) : _data(sizeBytes, 0) {}
+  // Real EEPROMs read back as all-0xFF after a factory reset/erase, not
+  // all-zero; match that so cold-start detection logic (e.g. CRC32 checks,
+  // WearLevelingPageData's writeSequenceId discovery) is exercised the same
+  // way it would be against real silicon.
+  explicit FakeEeprom(size_t sizeBytes) : _data(sizeBytes, 0xFF) {}
 
   size_t read(void *buf, addr_t addr, size_t count) override {
     size_t avail = available(addr, count);
