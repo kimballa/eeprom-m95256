@@ -16,6 +16,12 @@
 #include <cstdint>
 #include <vector>
 
+// Re-declared here (matching the declaration in src/eeprom-m95256.h, defined
+// in src/eeprom-m95256.cpp) rather than included, to avoid a circular
+// include: Arduino.h (the test harness stand-in) includes this file, and
+// eeprom-m95256.h includes Arduino.h.
+extern volatile bool forceSuppressEepromWrite;
+
 class FakeSpiBus {
 public:
   explicit FakeSpiBus(size_t sizeBytes) : _mem(sizeBytes, 0) {}
@@ -28,8 +34,16 @@ public:
     _countedThisWrite = false;
   }
 
-  /** End the chip-select-asserted transaction. */
-  void endTransaction() { _phase = Phase::Idle; }
+  /** End the chip-select-asserted transaction. If this was a WRITE-opcode
+   * transaction, arm the configured number of "busy" RDSR polls (see
+   * setBusyPollsPerWrite()), simulating that the device hasn't yet
+   * committed the page it was just sent. */
+  void endTransaction() {
+    if (_opcode == OPCODE_WRITE) {
+      _busyPollsRemaining = _busyPollsPerWrite;
+    }
+    _phase = Phase::Idle;
+  }
 
   /** Emulate one byte of full-duplex SPI transfer against the fake device. */
   uint8_t transfer(uint8_t out) {
@@ -65,6 +79,19 @@ public:
    * page transactions. */
   size_t writeTransactionCount() const { return _writeTransactionCount; }
 
+  /** After each completed WRITE-opcode transaction, make the next `n` RDSR
+   * polls report the device as busy (WIP bit set) before reporting ready
+   * again, simulating a real device's page-commit latency. Defaults to 0
+   * (never busy), matching this fake's original always-ready behavior. */
+  void setBusyPollsPerWrite(size_t n) { _busyPollsPerWrite = n; }
+
+  /** Set the global `forceSuppressEepromWrite` flag as soon as the `n`'th
+   * WRITE-opcode transaction completes, simulating a brownout/IRQ tripping
+   * it mid-transfer (rather than a test setting it before the call even
+   * begins, which only proves the *first* check works). 0 (the default)
+   * disables this. */
+  void setSuppressWriteAfterTransactions(size_t n) { _suppressAfterTransactions = n; }
+
 private:
   enum class Phase { Idle, Opcode, Address, Data };
 
@@ -73,10 +100,20 @@ private:
   static constexpr uint8_t OPCODE_READ = 0x03;
   static constexpr uint8_t OPCODE_WRITE = 0x02;
 
+  // Bit 0 of the M95256 status register: write-in-progress (see
+  // EEPROM_STATUS_REG_WRITE_IN_PROGRESS in eeprom-m95256.h). Hardcoded here
+  // rather than including that header, since this file deliberately models
+  // only the wire protocol, not the higher-level driver's vocabulary.
+  static constexpr uint8_t STATUS_REG_WIP_BIT = 0x01;
+
   uint8_t handleData(uint8_t out) {
     switch (_opcode) {
     case OPCODE_RDSR:
-      return 0x00; // Status register: never busy, write-enable bit unset.
+      if (_busyPollsRemaining > 0) {
+        _busyPollsRemaining--;
+        return STATUS_REG_WIP_BIT;
+      }
+      return 0x00;
 
     case OPCODE_READ: {
       uint8_t v = (_addr < _mem.size()) ? _mem[_addr] : 0xFF;
@@ -92,6 +129,12 @@ private:
       if (!_countedThisWrite) {
         _writeTransactionCount++;
         _countedThisWrite = true;
+        if (_suppressAfterTransactions > 0 && _writeTransactionCount >= _suppressAfterTransactions) {
+          // Simulate a brownout/IRQ tripping the write-suppression flag
+          // partway through a multi-page transfer, right after this page's
+          // commit -- so the driver's next per-page loop iteration sees it.
+          forceSuppressEepromWrite = true;
+        }
       }
       return 0xFF;
 
@@ -107,6 +150,9 @@ private:
   int _addrBytesLeft = 0;
   bool _countedThisWrite = false;
   size_t _writeTransactionCount = 0;
+  size_t _busyPollsPerWrite = 0;
+  size_t _busyPollsRemaining = 0;
+  size_t _suppressAfterTransactions = 0;
   std::vector<uint8_t> _mem;
 };
 
