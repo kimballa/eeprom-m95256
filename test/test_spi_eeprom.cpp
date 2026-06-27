@@ -24,7 +24,8 @@ TEST_SUITE("SpiEeprom (real driver, via FakeSpiBus)") {
 
 TEST_CASE("a write within a single page round-trips exactly via read()") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   uint8_t out[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
@@ -38,7 +39,8 @@ TEST_CASE("a write within a single page round-trips exactly via read()") {
 TEST_CASE("a write spanning multiple hardware pages lands at the correct "
           "byte offsets and uses one SPI write transaction per page") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   // Start 10 bytes before a page boundary (page size 64) and write 100
@@ -59,7 +61,8 @@ TEST_CASE("a write spanning multiple hardware pages lands at the correct "
 TEST_CASE("a write/read exactly at a page boundary uses exactly one page-write "
           "transaction") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   uint8_t out[64];
@@ -77,7 +80,8 @@ TEST_CASE("a write/read exactly at a page boundary uses exactly one page-write "
 TEST_CASE("a write that would exceed the top of the address space is "
           "truncated, and only the in-range bytes are actually written") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   // Device is 256 bytes (addr 0..255). Try to write 20 bytes starting at 250
@@ -96,7 +100,8 @@ TEST_CASE("a write that would exceed the top of the address space is "
 
 TEST_CASE("a read that would exceed the top of the address space is truncated") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   uint8_t in[20] = {0};
@@ -105,7 +110,8 @@ TEST_CASE("a read that would exceed the top of the address space is truncated") 
 
 TEST_CASE("reads and writes starting beyond the address space are rejected outright") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   uint8_t buf[4] = {1, 2, 3, 4};
@@ -116,7 +122,8 @@ TEST_CASE("reads and writes starting beyond the address space are rejected outri
 TEST_CASE("setting the global write-suppression flag aborts an in-progress "
           "multi-page write early") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   forceSuppressEepromWrite = true;
@@ -130,7 +137,8 @@ TEST_CASE("setting the global write-suppression flag aborts an in-progress "
 TEST_CASE("setting the global write-suppression flag before any write begins "
           "aborts it immediately, with zero bytes written") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   forceSuppressEepromWrite = true;
@@ -146,7 +154,8 @@ TEST_CASE("a multi-page write suppressed partway through (e.g. by a brownout IRQ
           "firing mid-transfer) commits exactly the pages already in flight and "
           "stops before the next one") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   // Trip forceSuppressEepromWrite itself as soon as the 2nd page-write
@@ -165,7 +174,8 @@ TEST_CASE("a multi-page write suppressed partway through (e.g. by a brownout IRQ
 TEST_CASE("isWriteInProgress()/waitForWriteComplete() reflect the device's WIP "
           "bit, and write() does not wait out the final page's own commit") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   fakeSpiBusInstance()->setBusyPollsPerWrite(2);
@@ -189,7 +199,8 @@ TEST_CASE("isWriteInProgress()/waitForWriteComplete() reflect the device's WIP "
 TEST_CASE("a multi-page write still lands all its data correctly even when the "
           "device reports busy between each page's commit") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
   fakeSpiBusInstance()->setBusyPollsPerWrite(2);
 
@@ -209,7 +220,8 @@ TEST_CASE("a multi-page write still lands all its data correctly even when the "
 TEST_CASE("a single-byte write/read at the very last valid address round-trips, "
           "and one byte past it is out of range") {
   resetFakeSpiBus(256);
-  TestEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
   dev.setup();
 
   uint8_t out = 0x7E;
@@ -227,7 +239,8 @@ TEST_CASE("a single-byte write/read at the very last valid address round-trips, 
 TEST_CASE("EepromM95256 (the real 256Kbit/64-byte-page part) constructs, sets "
           "up, and reports its geometry correctly") {
   resetFakeSpiBus(256 * 1024 / 8);
-  EepromM95256 dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  EepromM95256 dev(cs);
   dev.setup();
 
   CHECK(dev.getSizeBytes() == 256 * 1024 / 8);
@@ -241,7 +254,8 @@ TEST_CASE("a differently-sized SpiEeprom<> instantiation (small EEPROM, small "
   // confirm the driver's page-splitting logic is genuinely generic.
   using TinyPageEeprom = SpiEeprom<1024, 8>;
   resetFakeSpiBus(128);
-  TinyPageEeprom dev(10);
+  GpioSpiEepromChipSelect cs(10);
+  TinyPageEeprom dev(cs);
   dev.setup();
 
   CHECK(dev.getSizeBytes() == 128);

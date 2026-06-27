@@ -36,6 +36,36 @@ extern volatile bool forceSuppressEepromWrite;
  * prevents future writes. */
 inline void setEepromWriteLock() { forceSuppressEepromWrite = true; }
 
+/** Abstract interface to a mechanism to assert CS_L pin on SPI EEPROM. */
+class SpiEepromChipSelect {
+public:
+  virtual void init() {};
+  /** Set the CS_L pin low to select the SPI EEPROM device. */
+  virtual void select() = 0;
+  /** Set the CS_L pin high to deselect the SPI EEPROM device. */
+  virtual void deselect() = 0;
+};
+
+/** GPIO pin-based chip select mechanism for SPI EEPROM. */
+class GpioSpiEepromChipSelect : public SpiEepromChipSelect {
+public:
+  GpioSpiEepromChipSelect(uint8_t pin) : _pin(pin){};
+
+  virtual void init() override {
+    // Set up the chip-select pin as an output and assert it HIGH; we are not
+    // currently writing to the chip. This pin should always return HIGH
+    // when we are not actively transfering data.
+    pinMode(_pin, OUTPUT);
+    digitalWrite(_pin, HIGH);
+  };
+
+  virtual void select() override { digitalWrite(_pin, LOW); };
+  virtual void deselect() override { digitalWrite(_pin, HIGH); };
+
+private:
+  const uint8_t _pin;
+};
+
 /**
  * Base class for SpiEeprom, not specialized to a particular storage size.
  *
@@ -126,17 +156,14 @@ class SpiEeprom : public GenericSpiEeprom {
 public:
   using addr_t = uint16_t;
 
-  SpiEeprom(uint8_t csPin)
-      : _csPin(csPin),
+  SpiEeprom(SpiEepromChipSelect &chipSel)
+      : _chipSel(chipSel),
         _EEPROM_SPI_SETTINGS(_EEPROM_M95256_MAX_CLK, MSBFIRST, SPI_MODE0){};
 
   /** Initialize SPI bus on the chosen pin set. */
   void setup() {
-    // Set up the chip-select pin as an output and assert it HIGH; we are not
-    // currently writing to the DAC chip. This pin should always return HIGH
-    // when we are not actively transfering data.
-    pinMode(_csPin, OUTPUT);
-    digitalWrite(_csPin, HIGH);
+    _chipSel.init();
+    _chipSel.deselect();
   };
 
   /**
@@ -279,7 +306,7 @@ public:
   size_t getPageSize() const { return hwPageSizeBytes; };
 
 private:
-  const uint8_t _csPin;
+  SpiEepromChipSelect &_chipSel;
 
   /**
    * Execute an SPI transaction.
@@ -311,7 +338,7 @@ private:
     numReceived = 0;
     SPI.beginTransaction(_EEPROM_SPI_SETTINGS);
     delayNanoseconds(50);
-    digitalWrite(this->_csPin, LOW);
+    _chipSel.select();
     delayNanoseconds(50);
 
     SPI.transfer(opcode);
@@ -340,7 +367,7 @@ private:
     }
 
     delayNanoseconds(50);
-    digitalWrite(this->_csPin, HIGH);
+    _chipSel.deselect();
     delayNanoseconds(50);
     SPI.endTransaction();
   };
@@ -383,7 +410,7 @@ private:
 /** STM M95256 256kbit EEPROM. */
 class EepromM95256 : public SpiEeprom<256 * 1024, 64> {
 public:
-  EepromM95256(uint8_t csPin) : SpiEeprom(csPin){};
+  EepromM95256(SpiEepromChipSelect &chipSel) : SpiEeprom(chipSel){};
 };
 
 #endif /* _EEPROM_M95256_LIB_H */
