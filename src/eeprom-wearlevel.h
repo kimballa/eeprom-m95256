@@ -546,6 +546,24 @@ public:
 constexpr size_t ERR_NO_FREE_PAGES = SIZE_MAX;
 
 /**
+ * How long (in ms) a single asynchronous store's write may take to commit
+ * before it's treated as a stalled (stuck-WIP) write rather than merely a slow
+ * one. The M95256 datasheet specifies a 5ms max write time; this allows
+ * generous margin. Shared by the records' verifyAsync() and by
+ * EepromPageManager's slow-write advisory in the synchronous storeRecord().
+ */
+constexpr unsigned long WRITE_STALL_THRESHOLD_MILLIS = 20;
+
+/**
+ * Outcome of an asynchronous store, as reported by DataMappable::verifyAsync()
+ * and EepromPageManager::verifyAsync().
+ *   - IN_PROGRESS: the write hasn't committed yet; poll again later.
+ *   - SUCCESS: the write committed and verified (possibly after recovery).
+ *   - FAILED: the write could not be made durable even after recovery.
+ */
+enum class AsyncStoreStatus { IN_PROGRESS, SUCCESS, FAILED };
+
+/**
  * A bitmap indicating which pages are in use for data.
  *
  * Each bit in this array represents one page in the EEPROM. A zero in bit
@@ -670,6 +688,32 @@ public:
    * without disturbing the in-RAM `data`. Used by diagnostics
    * (EepromPageManager::verifyAll()) and the slow-write advisory path. */
   virtual bool verify() const = 0;
+
+  /**
+   * Asynchronous counterpart to store(): build this record's page image into
+   * `pendingImageBuf` and issue the underlying write, but do NOT wait for the
+   * write to commit or read it back. Pairs with verifyAsync().
+   *
+   * `pendingImageBuf` must be at least one hardware page in size; it is owned
+   * and supplied by the caller (a single shared buffer on the
+   * EepromPageManager). Its contents must be preserved unchanged until the
+   * matching verifyAsync() returns a terminal (non-IN_PROGRESS) result, since
+   * verifyAsync() reads the stored copy back and compares it against this
+   * buffer. Only one async store may be outstanding per EEPROM at a time.
+   */
+  virtual void storeAsync(uint8_t *pendingImageBuf) = 0;
+
+  /**
+   * Check on an in-flight storeAsync(): returns IN_PROGRESS if the write hasn't
+   * committed yet, SUCCESS once it has committed and verified, or FAILED if it
+   * could not be made durable (after any record-internal recovery). On a
+   * detected stall (write-in-progress stuck past WRITE_STALL_THRESHOLD_MILLIS)
+   * this raises the global `isEepromWriteStalled` flag and reports FAILED.
+   *
+   * `pendingImageBuf` must be the same buffer (with the same contents) passed
+   * to the preceding storeAsync().
+   */
+  virtual AsyncStoreStatus verifyAsync(uint8_t *pendingImageBuf) = 0;
 };
 
 /**
@@ -833,35 +877,52 @@ public:
    * Returns true iff the write was verified.
    */
   bool store() override {
-    uint8_t buf[sizeof(T) + sizeof(uint32_t)];
-    memcpy(buf, &data, sizeof(T));
-
-    uint32_t crc = computeCrc32(buf, sizeof(T));
-    memcpy(buf + sizeof(T), &crc, sizeof(uint32_t));
-
-    size_t written = _eeprom.write(buf, _byteAddr(), sizeof(buf));
-    if (written != sizeof(buf)) {
+    uint8_t buf[_imageSize];
+    _buildImage(buf);
+    if (_eeprom.write(buf, _byteAddr(), _imageSize) != _imageSize) {
       return false;
     }
+    return _verifyImage(buf);
+  }
 
-    uint8_t readBack[sizeof(T) + sizeof(uint32_t)];
-    size_t readCount = _eeprom.read(readBack, _byteAddr(), sizeof(readBack));
-    if (readCount != sizeof(readBack)) {
-      return false;
-    }
-    if (memcmp(buf, readBack, sizeof(readBack)) != 0) {
-      return false;
-    }
+  /**
+   * Asynchronous store: build the page image into the caller-supplied
+   * `pendingImageBuf` (>= one hardware page) and issue the write, but do not
+   * read it back. Stamps the write-start time so verifyAsync() can detect a
+   * stall. The buffer's contents must survive until verifyAsync() reports a
+   * terminal result.
+   */
+  void storeAsync(uint8_t *pendingImageBuf) override {
+    _buildImage(pendingImageBuf);
+    _eeprom.write(pendingImageBuf, _byteAddr(), _imageSize);
+    _writeStartMillis = millis();
+  }
 
-    uint32_t readBackCrc;
-    memcpy(&readBackCrc, readBack + sizeof(T), sizeof(uint32_t));
-    return computeCrc32(readBack, sizeof(T)) == readBackCrc;
+  /**
+   * Poll an in-flight storeAsync(). Returns IN_PROGRESS while the write hasn't
+   * committed (raising `isEepromWriteStalled` and reporting FAILED if it's
+   * stuck past WRITE_STALL_THRESHOLD_MILLIS), or once committed reads the page
+   * back and returns SUCCESS/FAILED. A single page has no internal recovery,
+   * so a FAILED here is left for the EepromPageManager to relocate.
+   *
+   * `pendingImageBuf` must hold the same image storeAsync() wrote.
+   */
+  AsyncStoreStatus verifyAsync(uint8_t *pendingImageBuf) override {
+    if (_eeprom.isWriteInProgress()) {
+      if (millis() - _writeStartMillis > WRITE_STALL_THRESHOLD_MILLIS) {
+        isEepromWriteStalled = true;
+        return AsyncStoreStatus::FAILED;
+      }
+      return AsyncStoreStatus::IN_PROGRESS;
+    }
+    return _verifyImage(pendingImageBuf) ? AsyncStoreStatus::SUCCESS
+                                         : AsyncStoreStatus::FAILED;
   }
 
   /** Confirm the stored copy's CRC32 without modifying `data`. */
   bool verify() const override {
-    uint8_t buf[sizeof(T) + sizeof(uint32_t)];
-    if (_eeprom.read(buf, _byteAddr(), sizeof(buf)) != sizeof(buf)) {
+    uint8_t buf[_imageSize];
+    if (_eeprom.read(buf, _byteAddr(), _imageSize) != _imageSize) {
       return false;
     }
     uint32_t storedCrc;
@@ -876,8 +937,34 @@ public:
   const addr_t recordId;
 
 private:
+  /** Bytes occupied by one stored image: T plus its CRC32 trailer. */
+  static constexpr size_t _imageSize = sizeof(T) + sizeof(uint32_t);
+
   eeprom_addr_t _byteAddr() const {
     return static_cast<eeprom_addr_t>(_pageNum * hwPageSizeBytes);
+  }
+
+  /** Serialize `data` plus a freshly computed CRC32 trailer into `buf` (which
+   * must be at least `_imageSize` bytes). */
+  void _buildImage(uint8_t *buf) const {
+    memcpy(buf, &data, sizeof(T));
+    uint32_t crc = computeCrc32(buf, sizeof(T));
+    memcpy(buf + sizeof(T), &crc, sizeof(uint32_t));
+  }
+
+  /** Read the current page back and confirm it matches `expected`
+   * byte-for-byte and carries a self-consistent CRC32. */
+  bool _verifyImage(const uint8_t *expected) const {
+    uint8_t readBack[_imageSize];
+    if (_eeprom.read(readBack, _byteAddr(), _imageSize) != _imageSize) {
+      return false;
+    }
+    if (memcmp(expected, readBack, _imageSize) != 0) {
+      return false;
+    }
+    uint32_t readBackCrc;
+    memcpy(&readBackCrc, readBack + sizeof(T), sizeof(uint32_t));
+    return computeCrc32(readBack, sizeof(T)) == readBackCrc;
   }
 
   /** The hardware page currently backing this record. */
@@ -885,6 +972,10 @@ private:
 
   /** The EEPROM backing this data. */
   GenericSpiEeprom &_eeprom;
+
+  /** millis() at which the most recent storeAsync() issued its write; used by
+   * verifyAsync() to detect a stalled commit. */
+  unsigned long _writeStartMillis = 0;
 };
 
 /**
@@ -989,6 +1080,7 @@ public:
     _basePage = newBasePage;
     _currentSlot = 0;
     _currentSeq = 0;
+    _pendingSlot = NO_PENDING_SLOT;
   }
 
   /** Which of the `k` slots currently holds the most-recently-written data,
@@ -1141,6 +1233,93 @@ public:
     return false;
   }
 
+  /**
+   * Asynchronous store: write `data` to exactly ONE slot -- the next live slot
+   * in the round-robin ring -- and return without reading it back. Does NOT
+   * loop over further slots; that recovery happens in verifyAsync() if this
+   * slot turns out bad. Does not yet commit `_currentSlot`/`_currentSeq`.
+   *
+   * If the ring is worn out, has no deadlist bound, or has no live slot to
+   * write, no write is issued and verifyAsync() will report FAILED so the
+   * EepromPageManager can relocate the whole ring.
+   *
+   * `pendingImageBuf` must be at least one hardware page; verifyAsync() compares
+   * the readback against it.
+   */
+  void storeAsync(uint8_t *pendingImageBuf) override {
+    _pendingSlot = NO_PENDING_SLOT;
+    if (_deadList == nullptr || _deadSlotCount() * 2 >= k) {
+      return;
+    }
+
+    uint32_t nextSeq;
+    size_t startSlot;
+    if (_currentSeq == 0) {
+      nextSeq = 1;
+      startSlot = 0;
+    } else {
+      nextSeq = (_currentSeq == UINT32_MAX) ? 1 : _currentSeq + 1;
+      startSlot = (_currentSlot + 1) % k;
+    }
+
+    for (size_t attempt = 0; attempt < k; attempt++) {
+      size_t slot = (startSlot + attempt) % k;
+      if (_deadList->isPageDead(_basePage + slot)) {
+        continue;
+      }
+      _pendingSlot = slot;
+      _pendingSeq = nextSeq;
+      _writeStartMillis = millis();
+      _writeSlotAsync(slot, nextSeq, pendingImageBuf);
+      return;
+    }
+    // No live slot found; leave _pendingSlot == NO_PENDING_SLOT.
+  }
+
+  /**
+   * Poll an in-flight storeAsync(). Returns IN_PROGRESS while the slot write
+   * hasn't committed (raising `isEepromWriteStalled` and reporting FAILED if
+   * it's stuck past WRITE_STALL_THRESHOLD_MILLIS). Once committed, reads the
+   * slot back: on success commits `_currentSlot`/`_currentSeq` and returns
+   * SUCCESS; on failure marks that slot dead and synchronously walks the
+   * remaining live slots (via store()), returning SUCCESS if any takes the
+   * write, or FAILED if the ring is worn out -- at which point the
+   * EepromPageManager should relocate the whole ring.
+   *
+   * `pendingImageBuf` must hold the same image storeAsync() wrote.
+   */
+  AsyncStoreStatus verifyAsync(uint8_t *pendingImageBuf) override {
+    if (_pendingSlot == NO_PENDING_SLOT) {
+      return AsyncStoreStatus::FAILED;
+    }
+
+    if (_eeprom.isWriteInProgress()) {
+      if (millis() - _writeStartMillis > WRITE_STALL_THRESHOLD_MILLIS) {
+        isEepromWriteStalled = true;
+        _pendingSlot = NO_PENDING_SLOT;
+        return AsyncStoreStatus::FAILED;
+      }
+      return AsyncStoreStatus::IN_PROGRESS;
+    }
+
+    size_t pendingSlot = _pendingSlot;
+    _pendingSlot = NO_PENDING_SLOT;
+
+    if (_verifySlot(pendingSlot, pendingImageBuf)) {
+      _currentSlot = pendingSlot;
+      _currentSeq = _pendingSeq;
+      return AsyncStoreStatus::SUCCESS;
+    }
+
+    // The async slot's write didn't verify. Retire it and synchronously walk
+    // the remaining live slots. Resuming store() after `pendingSlot` (with
+    // `_currentSeq` left at the old verified value) recomputes the same target
+    // sequence and skips the now-dead slot.
+    _deadList->markPageDead(_basePage + pendingSlot);
+    _currentSlot = pendingSlot;
+    return store() ? AsyncStoreStatus::SUCCESS : AsyncStoreStatus::FAILED;
+  }
+
   /** Confirm at least one slot in the ring holds a CRC-valid record, without
    * disturbing the in-RAM `data`. */
   bool verify() const override {
@@ -1162,6 +1341,9 @@ public:
 private:
   /** Bytes occupied by one ring slot: writeSequenceId + T + CRC32. */
   static constexpr size_t _slotSize = 2 * sizeof(uint32_t) + sizeof(T);
+
+  /** `_pendingSlot` value meaning "no async write is outstanding". */
+  static constexpr size_t NO_PENDING_SLOT = SIZE_MAX;
 
   /** Byte address of the `slot`'th hardware page in the ring. */
   eeprom_addr_t _pageAddr(size_t slot) const {
@@ -1198,33 +1380,44 @@ private:
   }
 
   /**
-   * Write `data` (tagged with `seq`) to ring slot `slot`, then read it back
-   * and confirm it matches byte-for-byte and via CRC32, exactly as
-   * `PageBackedData::store()` does for its single page.
+   * Build `data` (tagged with `seq`) into `buf` (>= `_slotSize`) and issue the
+   * write to ring slot `slot`, without reading it back. Returns false if the
+   * write call itself reported a short count. Pair with `_verifySlot()`.
    */
-  bool _writeSlot(size_t slot, uint32_t seq) {
-    uint8_t buf[_slotSize];
+  bool _writeSlotAsync(size_t slot, uint32_t seq, uint8_t *buf) {
     memcpy(buf, &seq, sizeof(seq));
     memcpy(buf + sizeof(seq), &data, sizeof(T));
 
     uint32_t crc = computeCrc32(buf, sizeof(seq) + sizeof(T));
     memcpy(buf + sizeof(seq) + sizeof(T), &crc, sizeof(crc));
 
-    eeprom_addr_t pageAddr = _pageAddr(slot);
-    size_t written = _eeprom.write(buf, pageAddr, _slotSize);
-    if (written != _slotSize) {
-      return false;
-    }
+    return _eeprom.write(buf, _pageAddr(slot), _slotSize) == _slotSize;
+  }
 
+  /** Read ring slot `slot` back and confirm it matches `expected`
+   * byte-for-byte and carries a self-consistent CRC32. */
+  bool _verifySlot(size_t slot, const uint8_t *expected) const {
     uint8_t readBack[_slotSize];
     if (!_readSlot(slot, readBack)) {
       return false;
     }
-    if (memcmp(buf, readBack, _slotSize) != 0) {
+    if (memcmp(expected, readBack, _slotSize) != 0) {
       return false;
     }
-
     return _crcValid(readBack);
+  }
+
+  /**
+   * Write `data` (tagged with `seq`) to ring slot `slot`, then read it back
+   * and confirm it matches byte-for-byte and via CRC32, exactly as
+   * `PageBackedData::store()` does for its single page.
+   */
+  bool _writeSlot(size_t slot, uint32_t seq) {
+    uint8_t buf[_slotSize];
+    if (!_writeSlotAsync(slot, seq, buf)) {
+      return false;
+    }
+    return _verifySlot(slot, buf);
   }
 
   /** The base hardware page of the ring; the ring spans
@@ -1239,6 +1432,18 @@ private:
    * has been found/written yet (in which case the next store() starts the
    * ring over at slot 0, sequence 1). */
   uint32_t _currentSeq;
+
+  /** The slot a storeAsync() wrote and is awaiting verifyAsync() for, or
+   * NO_PENDING_SLOT when no async write is outstanding. */
+  size_t _pendingSlot = NO_PENDING_SLOT;
+
+  /** The writeSequenceId tagged onto `_pendingSlot`'s in-flight write; promoted
+   * to `_currentSeq` once verifyAsync() confirms it. */
+  uint32_t _pendingSeq = 0;
+
+  /** millis() at which the most recent storeAsync() issued its slot write; used
+   * by verifyAsync() to detect a stalled commit. */
+  unsigned long _writeStartMillis = 0;
 
   /** The EEPROM backing this ring. */
   GenericSpiEeprom &_eeprom;
@@ -1346,12 +1551,6 @@ public:
 
   /** The page-manager system's own on-disk format version. */
   static constexpr uint32_t SYSTEM_FORMAT_VERSION = 1;
-
-  /** How long (in ms) a single `storeRecord()` write+readback may take before
-   * it's treated as a suspiciously slow write, prompting an advisory readback
-   * verification (not, by itself, a relocation). The M95256 datasheet
-   * specifies a 5ms max write time; this allows generous margin. */
-  static constexpr unsigned long WRITE_STALL_THRESHOLD_MILLIS = 20;
 
   /** Root page is valid: magic, system version, and app version all check out.
    */
@@ -1507,11 +1706,11 @@ public:
    * (e.g. one delayed by interrupt latency) is kept in place, and only an
    * actually-failed readback triggers relocation.
    *
-   * NOTE: this advisory readback is meaningful only because write() today is
-   * synchronous (the cell commit has completed by the time it returns). If/when
-   * write() becomes asynchronous -- letting the MCU proceed before the
-   * low-level flush completes -- a slow write would need its commit confirmed
-   * before this verify() could be trusted; revisit this path then.
+   * NOTE: this advisory readback is meaningful only because store() here is
+   * fully synchronous (it issues the write AND reads it back, so the cell
+   * commit has completed by the time it returns). The asynchronous
+   * storeRecordAsync()/verifyAsync() pair below is where the write-in-progress
+   * and stall handling lives for callers that don't want to block.
    *
    * Returns true iff `record` ends up durably (and verifiably) stored
    * somewhere.
@@ -1530,6 +1729,44 @@ public:
     }
 
     return true;
+  }
+
+  /**
+   * Asynchronous counterpart to storeRecord(): issue `record`'s write into the
+   * manager's shared page-image buffer and return immediately, without waiting
+   * for the cell commit. The caller must then poll verifyAsync(record) until it
+   * returns a terminal (non-IN_PROGRESS) result before issuing the next
+   * storeRecordAsync() for ANY record (only one async write may be outstanding
+   * at a time, since the device has a single chip-wide write-in-progress bit).
+   */
+  void storeRecordAsync(DataMappable &record) {
+    record.storeAsync(_pendingImage);
+  }
+
+  /**
+   * Poll an in-flight storeRecordAsync(). Returns IN_PROGRESS while the write
+   * is still committing, SUCCESS once it has committed and verified (including
+   * any record-internal recovery, e.g. a ring trying its next slot), or FAILED
+   * if the record could not be stored in place. On FAILED, this relocates the
+   * record to a fresh run of pages and updates the system structures
+   * (synchronously, exactly as storeRecord() would), returning SUCCESS if that
+   * succeeds or FAILED if there's nowhere left to relocate.
+   *
+   * Stall handling: if the write-in-progress bit is stuck past
+   * WRITE_STALL_THRESHOLD_MILLIS the global `isEepromWriteStalled` flag is
+   * raised (by the record's verifyAsync()) and FAILED is reported. On a truly
+   * hung device the relocation writes attempted here fail fast (the low-level
+   * write() times out waiting for the WIP bit) rather than hanging, so this
+   * still returns promptly. A stuck chip cannot be written anywhere, so this is
+   * the best recovery possible; react to `isEepromWriteStalled` out-of-band.
+   */
+  AsyncStoreStatus verifyAsync(DataMappable &record) {
+    AsyncStoreStatus status = record.verifyAsync(_pendingImage);
+    if (status == AsyncStoreStatus::FAILED) {
+      return _relocateAndStore(record) ? AsyncStoreStatus::SUCCESS
+                                       : AsyncStoreStatus::FAILED;
+    }
+    return status; // IN_PROGRESS or SUCCESS
   }
 
   /**
@@ -1708,6 +1945,14 @@ private:
 
   /** First hardware page available for application data. */
   const size_t _firstDataPageNum;
+
+  /** Single shared scratch buffer for the asynchronous store/verify path: a
+   * record's storeAsync() builds its page image here, and the matching
+   * verifyAsync() reads the stored copy back and compares against it. Sized to
+   * one hardware page (the largest image any record produces). Reusing one
+   * buffer for all records is safe because at most one async write may be
+   * outstanding at a time (the device has a single write-in-progress bit). */
+  uint8_t _pendingImage[hwPageSizeBytes];
 };
 
 #endif /* _EEPROM_WEAR_LEVEL_H */

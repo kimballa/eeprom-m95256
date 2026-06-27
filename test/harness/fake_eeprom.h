@@ -40,6 +40,13 @@ public:
       return 0;
     }
 
+    // A stuck write-in-progress bit means the device can't accept a new write
+    // anywhere; the real driver's write() would time out waiting on the WIP bit
+    // and return 0. Model that here so async recovery fails fast, not hangs.
+    if (_wipStuck) {
+      return 0;
+    }
+
     _writeCount++;
 
     if (_powerLossArmed && _writeCount == _powerLossAtWrite) {
@@ -63,7 +70,29 @@ public:
     if (_writeDelayMillis > 0) {
       advanceFakeMillis(_writeDelayMillis);
     }
+    // Arm the configured number of "busy" WIP polls so that an immediately
+    // following isWriteInProgress() reports the device as still committing,
+    // simulating real page-program latency for the async store/verify path.
+    _wipPollsRemaining = _wipPollsPerWrite;
     return avail;
+  }
+
+  /**
+   * Model the device's write-in-progress (WIP) status bit. Returns true while a
+   * just-issued write is still "committing" (for the configured number of polls,
+   * see setWipPollsPerWrite()), or always true while a stall is simulated (see
+   * setWipStuck()). Marked const, like the real driver's status-register read;
+   * the poll countdown is therefore mutable.
+   */
+  bool isWriteInProgress() const override {
+    if (_wipStuck) {
+      return true;
+    }
+    if (_wipPollsRemaining > 0) {
+      _wipPollsRemaining--;
+      return true;
+    }
+    return false;
   }
 
   size_t size() const { return _data.size(); }
@@ -107,6 +136,16 @@ public:
   /** Clear a previously-set faulty byte, so writes to it stick again. */
   void clearFaultyByte() { _faultyByteSet = false; }
 
+  /** After each completed write(), make the next `n` isWriteInProgress() polls
+   * report the device as busy before reporting ready, simulating a real
+   * device's page-commit latency. Defaults to 0 (write commits immediately). */
+  void setWipPollsPerWrite(size_t n) { _wipPollsPerWrite = n; }
+
+  /** Simulate a hung device whose write-in-progress bit never clears:
+   * isWriteInProgress() always returns true, and write() refuses (returns 0),
+   * exactly as a real chip stuck mid-program would behave. */
+  void setWipStuck(bool stuck) { _wipStuck = stuck; }
+
 private:
   size_t available(addr_t addr, size_t count) const {
     if (addr >= _data.size()) {
@@ -119,6 +158,13 @@ private:
   unsigned long _writeDelayMillis = 0;
   addr_t _faultyByte = 0;
   bool _faultyByteSet = false;
+
+  /** Number of "busy" WIP polls to arm after each write (see
+   * setWipPollsPerWrite()), and the live countdown of polls remaining. */
+  size_t _wipPollsPerWrite = 0;
+  mutable size_t _wipPollsRemaining = 0;
+  /** When true, isWriteInProgress() never clears and write() refuses. */
+  bool _wipStuck = false;
 
   size_t _writeCount = 0;
   bool _powerLossArmed = false;

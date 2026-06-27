@@ -344,4 +344,136 @@ TEST_CASE("EepromPageManager::storeRecord() relocates a WearLevelingPageData rin
   CHECK(reloaded.data == (Widget{3, 3}));
 }
 
+TEST_CASE("storeAsync() writes exactly one slot and does not yet commit "
+          "currentSlot/currentWriteSeqId") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
+  Ring ring(/*recordId=*/0, eeprom);
+  ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
+  eeprom.setWipPollsPerWrite(2); // Keep the write "in flight" across polls.
+
+  size_t writesBefore = eeprom.writeCount();
+  ring.data = Widget{1, 2};
+  uint8_t buf[kPageSize];
+  ring.storeAsync(buf);
+
+  // Exactly one physical page write was issued, and nothing is committed yet.
+  CHECK(eeprom.writeCount() == writesBefore + 1);
+  CHECK(ring.currentWriteSeqId() == 0);
+
+  CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::IN_PROGRESS);
+  CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::IN_PROGRESS);
+  CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::SUCCESS);
+
+  // Now committed at slot 0, seq 1, and a reboot can find it.
+  CHECK(ring.currentSlot() == 0);
+  CHECK(ring.currentWriteSeqId() == 1);
+
+  Ring reader(/*recordId=*/0, eeprom);
+  reader.setPageNum(4);
+  CHECK(reader.load() == true);
+  CHECK(reader.data == (Widget{1, 2}));
+}
+
+TEST_CASE("async stores advance round-robin across slots, exactly like store()") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
+  Ring ring(/*recordId=*/0, eeprom);
+  ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
+
+  uint8_t buf[kPageSize];
+  for (size_t i = 0; i < kRingSize * 2; i++) {
+    ring.data = Widget{static_cast<uint32_t>(i), 0};
+    ring.storeAsync(buf);
+    CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::SUCCESS);
+    CHECK(ring.currentSlot() == i % kRingSize);
+    CHECK(ring.currentWriteSeqId() == i + 1);
+  }
+}
+
+TEST_CASE("verifyAsync() recovery: a bad async slot is marked dead and the next "
+          "live slot synchronously takes the write") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
+  Ring ring(/*recordId=*/0, eeprom);
+  ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
+
+  uint8_t buf[kPageSize];
+  ring.data = Widget{1, 1};
+  ring.storeAsync(buf); // slot 0
+  CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::SUCCESS);
+  CHECK(ring.currentSlot() == 0);
+
+  // Slot 1's page is unreliable; the async write to it won't verify.
+  eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>((4 + 1) * kPageSize));
+  ring.data = Widget{2, 2};
+  ring.storeAsync(buf); // targets slot 1
+  CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::SUCCESS); // recovers to slot 2
+
+  CHECK(ring.currentSlot() == 2);
+  CHECK(ring.currentWriteSeqId() == 2);
+  CHECK(deadList.isPageDead(4 + 1) == true);
+
+  Ring reader(/*recordId=*/0, eeprom);
+  reader.setPageNum(4);
+  CHECK(reader.load() == true);
+  CHECK(reader.data == (Widget{2, 2}));
+}
+
+TEST_CASE("storeAsync() on a worn-out ring issues no write and verifyAsync() "
+          "reports FAILED") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+  deadList.markPageDead(4 + 0);
+  deadList.markPageDead(4 + 2); // half the ring dead.
+
+  Ring ring(/*recordId=*/0, eeprom);
+  ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
+
+  uint8_t buf[kPageSize];
+  size_t writesBefore = eeprom.writeCount();
+  ring.data = Widget{1, 1};
+  ring.storeAsync(buf);
+  CHECK(eeprom.writeCount() == writesBefore); // Nothing was written.
+  CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::FAILED);
+  CHECK(ring.currentWriteSeqId() == 0);
+}
+
+TEST_CASE("verifyAsync() raises isEepromWriteStalled and FAILS on a stuck WIP "
+          "bit during an async slot write") {
+  isEepromWriteStalled = false;
+  resetFakeMillis();
+  FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
+  Ring ring(/*recordId=*/0, eeprom);
+  ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
+
+  uint8_t buf[kPageSize];
+  ring.data = Widget{1, 1};
+  ring.storeAsync(buf);
+  eeprom.setWipStuck(true);
+  advanceFakeMillis(WRITE_STALL_THRESHOLD_MILLIS + 1);
+
+  CHECK(ring.verifyAsync(buf) == AsyncStoreStatus::FAILED);
+  CHECK(isEepromWriteStalled == true);
+}
+
 }

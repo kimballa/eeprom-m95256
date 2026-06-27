@@ -228,6 +228,22 @@ TEST_CASE("waitForWriteComplete() returns true once the device actually "
   CHECK(dev.isWriteInProgress() == false);
 }
 
+TEST_CASE("isWriteInProgress() reflects the device WIP bit through a "
+          "GenericSpiEeprom& reference (virtual override)") {
+  resetFakeSpiBus(256);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
+  dev.setup();
+
+  GenericSpiEeprom &generic = dev; // Exercise the virtual dispatch path.
+  fakeSpiBusInstance()->setBusyPollsPerWrite(2);
+  uint8_t out[4] = {1, 2, 3, 4};
+  CHECK(dev.write(out, 0, sizeof(out)) == sizeof(out));
+  CHECK(generic.isWriteInProgress() == true);
+  CHECK(generic.isWriteInProgress() == true);
+  CHECK(generic.isWriteInProgress() == false);
+}
+
 TEST_CASE("read() fails (returns 0) if a previous write does not complete "
           "within waitForWriteComplete()'s default timeout") {
   resetFakeSpiBus(256);

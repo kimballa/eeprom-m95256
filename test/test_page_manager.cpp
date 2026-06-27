@@ -65,6 +65,20 @@ template <size_t numPages>
 using Mgr = EepromPageManager<numPages * kPageSize * 8, kPageSize>;
 using TestMgr = Mgr<kBigEnoughPages>;
 
+/** Poll a manager's verifyAsync(record) until it stops returning IN_PROGRESS,
+ * returning the terminal SUCCESS/FAILED result. Bounded so a stuck-WIP bug
+ * can't hang the test suite. */
+template <typename MgrT>
+AsyncStoreStatus pollVerify(MgrT &mgr, DataMappable &record) {
+  for (int i = 0; i < 1000; i++) {
+    AsyncStoreStatus s = mgr.verifyAsync(record);
+    if (s != AsyncStoreStatus::IN_PROGRESS) {
+      return s;
+    }
+  }
+  return AsyncStoreStatus::IN_PROGRESS; // Treated as a failure by callers.
+}
+
 } // namespace
 
 TEST_SUITE("EepromPageManager") {
@@ -309,7 +323,7 @@ TEST_CASE("storeRecord() does NOT relocate on a merely-slow (but verifiable) wri
   size_t oldPage = rec.getPageNum();
 
   resetFakeMillis();
-  eeprom.setWriteDelayMillis(TestMgr::WRITE_STALL_THRESHOLD_MILLIS + 5);
+  eeprom.setWriteDelayMillis(WRITE_STALL_THRESHOLD_MILLIS + 5);
 
   CHECK(mgr.storeRecord(rec) == true);
   // The slow write was correct, so the advisory readback passes and the
@@ -622,6 +636,195 @@ TEST_CASE("a record's data is never lost when a worn-out ring's relocation is "
       CHECK((ring.data == vOld || ring.data == vNew));
     }
   }
+}
+
+TEST_CASE("storeRecordAsync()/verifyAsync() persist a PageBackedData record with "
+          "no system-page changes on the clean path") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  RecordSet recs(eeprom, 2);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  CHECK(mgr.formatNew() == true);
+  eeprom.setWipPollsPerWrite(3); // Make the write genuinely "in flight".
+
+  Record &rec = *recs.records[0];
+  rec.data = Widget{11, 22};
+  size_t originalPage = rec.getPageNum();
+  size_t dataMapBefore = mgr.dataMap().getStartPage(rec.getRecordId());
+
+  mgr.storeRecordAsync(rec);
+  // First poll(s) see the write still committing.
+  CHECK(mgr.verifyAsync(rec) == AsyncStoreStatus::IN_PROGRESS);
+  CHECK(pollVerify(mgr, rec) == AsyncStoreStatus::SUCCESS);
+
+  // Common case: nothing relocated, no system structures touched.
+  CHECK(rec.getPageNum() == originalPage);
+  CHECK(mgr.deadList().isPageLive(originalPage));
+  CHECK(mgr.usage().isPageInUse(originalPage));
+  CHECK(mgr.dataMap().getStartPage(rec.getRecordId()) == dataMapBefore);
+  CHECK(isEepromWriteStalled == false);
+
+  Record reloaded(rec.getRecordId(), eeprom);
+  reloaded.setPageNum(rec.getPageNum());
+  CHECK(reloaded.load() == true);
+  CHECK(reloaded.data == rec.data);
+}
+
+TEST_CASE("storeRecordAsync()/verifyAsync() keep a WearLevelingPageData write "
+          "within its ring (data map start page unchanged)") {
+  isEepromWriteStalled = false;
+  constexpr size_t kRingSize = 4;
+  using Ring = WearLevelingPageData<Widget, kPageSize, kRingSize>;
+
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  Ring ring(/*recordId=*/0, eeprom);
+  DataMappable *records[] = {&ring};
+  TestMgr mgr(eeprom, records, 1, 1);
+  ring.setDeadPageOracle(mgr.deadList());
+  CHECK(mgr.formatNew() == true);
+  size_t base = ring.getPageNum();
+
+  ring.data = Widget{1, 1};
+  mgr.storeRecordAsync(ring);
+  CHECK(pollVerify(mgr, ring) == AsyncStoreStatus::SUCCESS);
+  CHECK(ring.getPageNum() == base); // Same ring.
+  CHECK(mgr.dataMap().getStartPage(0) == base);
+
+  Ring reader(/*recordId=*/0, eeprom);
+  reader.setPageNum(static_cast<Ring::addr_t>(base));
+  CHECK(reader.load() == true);
+  CHECK(reader.data == (Widget{1, 1}));
+}
+
+TEST_CASE("verifyAsync() relocates a PageBackedData record whose page goes bad, "
+          "mirroring the synchronous storeRecord() relocation") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  RecordSet recs(eeprom, 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  CHECK(mgr.formatNew() == true);
+
+  Record &rec = *recs.records[0];
+  rec.data = Widget{1, 2};
+  size_t oldPage = rec.getPageNum();
+  eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>(oldPage * kPageSize));
+
+  mgr.storeRecordAsync(rec);
+  CHECK(pollVerify(mgr, rec) == AsyncStoreStatus::SUCCESS); // relocated.
+
+  size_t newPage = rec.getPageNum();
+  CHECK(newPage != oldPage);
+  CHECK(mgr.deadList().isPageDead(oldPage));
+  CHECK(mgr.usage().isPageInUse(oldPage)); // dead pages stay reserved.
+  CHECK(mgr.usage().isPageInUse(newPage));
+  CHECK(mgr.dataMap().getStartPage(rec.getRecordId()) == newPage);
+  CHECK(mgr.verifyAll().ok);
+
+  Record reloaded(rec.getRecordId(), eeprom);
+  reloaded.setPageNum(static_cast<Record::addr_t>(newPage));
+  CHECK(reloaded.load() == true);
+  CHECK(reloaded.data == rec.data);
+}
+
+TEST_CASE("verifyAsync() relocates a worn-out WearLevelingPageData ring wholesale") {
+  isEepromWriteStalled = false;
+  constexpr size_t kRingSize = 4;
+  using Ring = WearLevelingPageData<Widget, kPageSize, kRingSize>;
+
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  Ring ring(/*recordId=*/0, eeprom);
+  DataMappable *records[] = {&ring};
+  TestMgr mgr(eeprom, records, 1, 1);
+  ring.setDeadPageOracle(mgr.deadList());
+  CHECK(mgr.formatNew() == true);
+
+  ring.data = Widget{1, 1};
+  mgr.storeRecordAsync(ring);
+  CHECK(pollVerify(mgr, ring) == AsyncStoreStatus::SUCCESS);
+  size_t oldBase = ring.getPageNum();
+
+  // Wear the ring out: half its slots dead, so the next async store can't place
+  // anywhere in the ring and must relocate the whole block.
+  mgr.deadList().markPageDead(oldBase + 1);
+  mgr.deadList().markPageDead(oldBase + 3);
+
+  ring.data = Widget{2, 2};
+  mgr.storeRecordAsync(ring);
+  CHECK(pollVerify(mgr, ring) == AsyncStoreStatus::SUCCESS);
+
+  size_t newBase = ring.getPageNum();
+  CHECK(newBase != oldBase);
+  CHECK(mgr.dataMap().getStartPage(0) == newBase);
+  for (size_t j = 0; j < kRingSize; j++) {
+    CHECK(mgr.deadList().isPageDead(oldBase + j) == true);
+  }
+
+  Ring reader(/*recordId=*/0, eeprom);
+  reader.setPageNum(static_cast<Ring::addr_t>(newBase));
+  CHECK(reader.load() == true);
+  CHECK(reader.data == (Widget{2, 2}));
+}
+
+TEST_CASE("verifyAsync() returns FAILED when a bad record has nowhere to relocate") {
+  isEepromWriteStalled = false;
+  // Exactly one data page, so a failed page has no relocation target.
+  FakeEeprom eeprom(8 * kPageSize);
+  RecordSet recs(eeprom, 1);
+  Mgr<8> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  CHECK(mgr.formatNew() == true);
+
+  Record &rec = *recs.records[0];
+  size_t oldPage = rec.getPageNum();
+  eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>(oldPage * kPageSize));
+
+  mgr.storeRecordAsync(rec);
+  CHECK(pollVerify(mgr, rec) == AsyncStoreStatus::FAILED);
+  CHECK(mgr.deadList().isPageDead(oldPage));
+}
+
+TEST_CASE("a stuck WIP bit makes verifyAsync() FAIL fast (no hang) and raises "
+          "isEepromWriteStalled") {
+  isEepromWriteStalled = false;
+  resetFakeMillis();
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  RecordSet recs(eeprom, 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  CHECK(mgr.formatNew() == true);
+
+  Record &rec = *recs.records[0];
+  rec.data = Widget{7, 8};
+  mgr.storeRecordAsync(rec);
+
+  // The chip hangs mid-commit: WIP never clears and no further write succeeds.
+  eeprom.setWipStuck(true);
+  advanceFakeMillis(WRITE_STALL_THRESHOLD_MILLIS + 1);
+
+  // Recovery's relocation writes fail fast (the fake refuses writes while
+  // stuck), so this returns FAILED promptly rather than hanging.
+  CHECK(mgr.verifyAsync(rec) == AsyncStoreStatus::FAILED);
+  CHECK(isEepromWriteStalled == true);
+}
+
+TEST_CASE("a synchronous storeRecord() works after an async SUCCESS on the same "
+          "record (sync and async interoperate)") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  RecordSet recs(eeprom, 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  CHECK(mgr.formatNew() == true);
+
+  Record &rec = *recs.records[0];
+  rec.data = Widget{1, 1};
+  mgr.storeRecordAsync(rec);
+  CHECK(pollVerify(mgr, rec) == AsyncStoreStatus::SUCCESS);
+
+  rec.data = Widget{2, 2};
+  CHECK(mgr.storeRecord(rec) == true);
+
+  Record reloaded(rec.getRecordId(), eeprom);
+  reloaded.setPageNum(rec.getPageNum());
+  CHECK(reloaded.load() == true);
+  CHECK(reloaded.data == (Widget{2, 2}));
 }
 
 }

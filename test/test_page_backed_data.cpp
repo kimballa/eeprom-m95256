@@ -135,4 +135,112 @@ TEST_CASE("two records on different pages do not interfere with each other") {
   CHECK(rb.data == b);
 }
 
+TEST_CASE("FakeEeprom models the WIP bit, reachable through a GenericSpiEeprom& "
+          "(vtable wiring for isWriteInProgress())") {
+  FakeEeprom eeprom(4096);
+  GenericSpiEeprom &dev = eeprom; // Exercise the virtual dispatch path.
+
+  CHECK(dev.isWriteInProgress() == false); // No config: ready immediately.
+
+  eeprom.setWipPollsPerWrite(2);
+  uint8_t payload[4] = {1, 2, 3, 4};
+  dev.write(payload, 0, sizeof(payload));
+  CHECK(dev.isWriteInProgress() == true);
+  CHECK(dev.isWriteInProgress() == true);
+  CHECK(dev.isWriteInProgress() == false); // Exactly 2 busy polls, then ready.
+}
+
+TEST_CASE("storeAsync()/verifyAsync() commit and round-trip when the write "
+          "commits immediately") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(4096);
+  Widget original{42, -7, "async"};
+  PageBackedData<Widget, kPageSize> writer(original, /*recordId=*/0, eeprom);
+  writer.setPageNum(2);
+
+  uint8_t buf[kPageSize];
+  writer.storeAsync(buf);
+  // No WIP polls armed, so the very first verifyAsync() sees the write done.
+  CHECK(writer.verifyAsync(buf) == AsyncStoreStatus::SUCCESS);
+
+  PageBackedData<Widget, kPageSize> reader(/*recordId=*/0, eeprom);
+  reader.setPageNum(2);
+  CHECK(reader.load() == true);
+  CHECK(reader.data == original);
+}
+
+TEST_CASE("verifyAsync() reports IN_PROGRESS until the device's WIP bit clears, "
+          "then SUCCESS") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(4096);
+  eeprom.setWipPollsPerWrite(2);
+  Widget original{1, 2, "wip"};
+  PageBackedData<Widget, kPageSize> writer(original, /*recordId=*/0, eeprom);
+
+  uint8_t buf[kPageSize];
+  writer.storeAsync(buf);
+  CHECK(writer.verifyAsync(buf) == AsyncStoreStatus::IN_PROGRESS);
+  CHECK(writer.verifyAsync(buf) == AsyncStoreStatus::IN_PROGRESS);
+  CHECK(writer.verifyAsync(buf) == AsyncStoreStatus::SUCCESS);
+  CHECK(isEepromWriteStalled == false);
+}
+
+TEST_CASE("verifyAsync() returns FAILED (no recovery at record level) when the "
+          "readback does not match") {
+  isEepromWriteStalled = false;
+  FakeEeprom eeprom(4096);
+  Widget original{3, 4, "bad"};
+  PageBackedData<Widget, kPageSize> writer(original, /*recordId=*/0, eeprom);
+  writer.setPageNum(2);
+  eeprom.setFaultyByte(2 * kPageSize); // Corrupt the page on every write to it.
+
+  uint8_t buf[kPageSize];
+  writer.storeAsync(buf);
+  CHECK(writer.verifyAsync(buf) == AsyncStoreStatus::FAILED);
+  CHECK(isEepromWriteStalled == false); // A readback mismatch is not a stall.
+}
+
+TEST_CASE("verifyAsync() raises isEepromWriteStalled and FAILS when the WIP bit "
+          "is stuck past the stall threshold") {
+  isEepromWriteStalled = false;
+  resetFakeMillis();
+  FakeEeprom eeprom(4096);
+  Widget original{5, 6, "stuck"};
+  PageBackedData<Widget, kPageSize> writer(original, /*recordId=*/0, eeprom);
+
+  uint8_t buf[kPageSize];
+  writer.storeAsync(buf);
+  eeprom.setWipStuck(true);
+  // Within the threshold it's still merely in progress.
+  CHECK(writer.verifyAsync(buf) == AsyncStoreStatus::IN_PROGRESS);
+  CHECK(isEepromWriteStalled == false);
+
+  advanceFakeMillis(WRITE_STALL_THRESHOLD_MILLIS + 1);
+  CHECK(writer.verifyAsync(buf) == AsyncStoreStatus::FAILED);
+  CHECK(isEepromWriteStalled == true);
+}
+
+TEST_CASE("an async store lands byte-for-byte identical bytes to a synchronous "
+          "store of the same data") {
+  isEepromWriteStalled = false;
+  Widget original{77, -3, "same"};
+
+  FakeEeprom syncEeprom(4096);
+  PageBackedData<Widget, kPageSize> syncWriter(original, /*recordId=*/0, syncEeprom);
+  syncWriter.setPageNum(2);
+  CHECK(syncWriter.store() == true);
+
+  FakeEeprom asyncEeprom(4096);
+  PageBackedData<Widget, kPageSize> asyncWriter(original, /*recordId=*/0, asyncEeprom);
+  asyncWriter.setPageNum(2);
+  uint8_t buf[kPageSize];
+  asyncWriter.storeAsync(buf);
+  CHECK(asyncWriter.verifyAsync(buf) == AsyncStoreStatus::SUCCESS);
+
+  for (size_t i = 0; i < sizeof(Widget) + sizeof(uint32_t); i++) {
+    CHECK(syncEeprom.byteAt(2 * kPageSize + i) ==
+          asyncEeprom.byteAt(2 * kPageSize + i));
+  }
+}
+
 }

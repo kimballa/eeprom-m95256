@@ -32,6 +32,13 @@ inline constexpr bool isPowerOf2(int v) { return v && ((v & (v - 1)) == 0); }
 // (e.g., on brownout detection.)
 extern volatile bool forceSuppressEepromWrite;
 
+// Raised by the asynchronous store/verify path (see eeprom-wearlevel.h) when a
+// write's in-progress bit stays set past the stall threshold -- i.e. the device
+// appears hung and no page anywhere can be written. Defaults to false; the
+// library only ever sets it true, so the calling context can detect and react
+// to a stuck-write condition out-of-band (and is responsible for clearing it).
+extern volatile bool isEepromWriteStalled;
+
 /** Set the EEPROM write lock to true. Immediately aborts in-progress writes and
  * prevents future writes. */
 inline void setEepromWriteLock() { forceSuppressEepromWrite = true; }
@@ -76,6 +83,9 @@ public:
   using addr_t = uint16_t;
   virtual size_t read(void *buf, addr_t addr, size_t count) = 0;
   virtual size_t write(void *buf, addr_t addr, size_t count) = 0;
+  /** Returns true if there is a pending (uncommitted) write operation. Lets
+   * higher-level code poll for write completion without blocking. */
+  virtual bool isWriteInProgress() const = 0;
 };
 
 /**
@@ -304,7 +314,7 @@ public:
   };
 
   /** Returns true if there is a pending write operation. */
-  bool isWriteInProgress() const {
+  bool isWriteInProgress() const override {
     return (readStatusRegister() & EEPROM_STATUS_REG_WRITE_IN_PROGRESS) != 0;
   };
 
