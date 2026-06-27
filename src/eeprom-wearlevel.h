@@ -41,12 +41,26 @@ inline uint32_t computeCrc32(const uint8_t *data, size_t len) {
  * Crash-safe persistence engine for a fixed-size in-RAM byte buffer, shared by
  * the page bitmaps and the data map so that all three behave identically.
  *
+ * ## Data Buffer
+ *
+ * The client of RedundantPagedStore allocates the in-RAM byte buffer, specifies
+ * the buffer address to the RedundantPagedStore constructor, and retains its
+ * own pointer to the buffer. The client directly manipulates the data through
+ * that pointer, rather than going through RedundantPagedStore. The client is
+ * responsible for using markDirty() / markDirtyByteRange() after making any
+ * updates to the data in the buffer, and for calling flushDirty() when
+ * necessary.
+ *
+ * ## Serialization
+ *
  * The buffer is serialized across `numPages()` hardware pages. Two redundant
  * copies are kept: copy A starts at hardware page `copyAStartPage`, copy B at
  * `copyBStartPage`. Each logical table page occupies one hardware page in each
  * copy, laid out as:
  *
- *   [seqId : uint32_t][payload bytes][CRC32 of seqId+payload]
+ *   [seqId : uint32_t][N payload bytes][CRC32 of seqId+payload]
+ *
+ * N is the number of bytes per EEPROM hardware page - 2 * sizeof(uint32_t).
  *
  * Every table page is *independently* versioned. On load() each page is taken
  * from whichever of its two slots is CRC-valid and has the higher seqId, so a
@@ -67,28 +81,30 @@ inline uint32_t computeCrc32(const uint8_t *data, size_t len) {
  *     copy A:  [v0*] [v1*] [v2*]      (* = active slot, the one load() reads)
  *     copy B:  [v0 ] [v1 ] [v2 ]
  *
- * Now update only the middle page (page 1 -> v1'). Its inactive slot is B, so
- * v1' is written there and page 1's active pointer flips to B; pages 0 and 2
+ * Now update only the middle page (page 1 -> v3). Its inactive slot is B, so
+ * v3 is written there and page 1's active pointer flips to B; pages 0 and 2
  * are untouched. The live composite now reads A,B,A:
  *
  *     copy A:  [v0*] [v1 ] [v2*]      (page 1's copy A is now its stale backup)
- *     copy B:  [v0 ] [v1'*] [v2 ]
+ *     copy B:  [v0 ] [v3*] [v2 ]
  *
- * A crash midway through writing v1' just leaves the old v1 in copy A still
+ * A crash midway through writing v3 just leaves the old v1 in copy A still
  * active and valid. The next update of page 1 would write back to slot A,
  * returning to A,A,A -- each page ping-pongs between its two slots.
  *
  * @param hwPageSizeBytes the size of one write page for the EEPROM, in bytes.
  */
 template <size_t hwPageSizeBytes> class RedundantPagedStore {
-  static_assert(hwPageSizeBytes > 2 * sizeof(uint32_t),
-                "hardware page must be larger than the seqId + CRC32 overhead.");
+  static_assert(
+      hwPageSizeBytes > 2 * sizeof(uint32_t),
+      "hardware page must be larger than the seqId + CRC32 overhead.");
 
 public:
   /** Per-page overhead: a leading seqId and a trailing CRC32. */
   static constexpr size_t PER_PAGE_OVERHEAD = 2 * sizeof(uint32_t);
   /** Payload bytes carried by each hardware page (rest is overhead). */
-  static constexpr size_t PAYLOAD_PER_PAGE = hwPageSizeBytes - PER_PAGE_OVERHEAD;
+  static constexpr size_t PAYLOAD_PER_PAGE =
+      hwPageSizeBytes - PER_PAGE_OVERHEAD;
 
   RedundantPagedStore(GenericSpiEeprom &eeprom, uint8_t *buf, size_t bufLen,
                       uint32_t copyAStartPage, uint32_t copyBStartPage)
@@ -98,17 +114,36 @@ public:
         _seq(_numPages ? new uint32_t[_numPages] : nullptr),
         _active(_numPages ? new uint8_t[_numPages] : nullptr),
         _dirty(_numPages ? new bool[_numPages] : nullptr) {
-    for (size_t i = 0; i < _numPages; i++) {
-      _seq[i] = 0;
-      _active[i] = 0;
-      _dirty[i] = false;
+    if (_numPages) {
+      memset(_seq, 0, sizeof(uint32_t) * _numPages);
+      memset(_active, 0, sizeof(uint8_t) * _numPages);
+      memset(_dirty, 0, sizeof(bool) * _numPages);
     }
   }
 
+  RedundantPagedStore(RedundantPagedStore<hwPageSizeBytes> &&store)
+      : _eeprom(store._eeprom), _buf(store._buf), _bufLen(store._bufLen),
+        _numPages(store._numPages), _copyA(store._copyA), _copyB(store._copyB),
+        _seq(store._seq), _active(store._active), _dirty(store._dirty) {
+    // Transfer ownership of variable-length state arrays; don't allocate new
+    // ones and free the old ones.
+    store._seq = nullptr;
+    store._active = nullptr;
+    store._dirty = nullptr;
+  }
+
   ~RedundantPagedStore() {
-    delete[] _seq;
-    delete[] _active;
-    delete[] _dirty;
+    if (_seq) {
+      delete[] _seq;
+    }
+
+    if (_active) {
+      delete[] _active;
+    }
+
+    if (_dirty) {
+      delete[] _dirty;
+    }
   }
 
   /** Number of hardware pages each copy spans. */
@@ -170,11 +205,11 @@ public:
     }
   }
 
-  /** Mark dirty every table page touched by buffer bytes [firstByte,
-   * lastByte]. */
-  void markDirtyByteRange(size_t firstByte, size_t lastByte) {
-    size_t firstPage = firstByte / PAYLOAD_PER_PAGE;
-    size_t lastPage = lastByte / PAYLOAD_PER_PAGE;
+  /** Mark dirty every table page touched by buffer bytes [firstByteIdx,
+   * lastByteIdx]. */
+  void markDirtyByteRange(size_t firstByteIdx, size_t lastByteIdx) {
+    size_t firstPage = firstByteIdx / PAYLOAD_PER_PAGE;
+    size_t lastPage = lastByteIdx / PAYLOAD_PER_PAGE;
     for (size_t p = firstPage; p <= lastPage && p < _numPages; p++) {
       _dirty[p] = true;
     }
@@ -191,6 +226,7 @@ public:
       if (!_dirty[p]) {
         continue;
       }
+      // Page A is '0', Page B is '1'; inactive page flag = 1 - _active
       uint8_t inactive = static_cast<uint8_t>(1 - _active[p]);
       uint32_t newSeq = _seq[p] + 1;
       if (_writeSlot(p, inactive, newSeq)) {
@@ -239,12 +275,14 @@ private:
                  uint8_t payloadOut[PAYLOAD_PER_PAGE], uint32_t &seqOut) const {
     size_t off = pageIndex * PAYLOAD_PER_PAGE;
     size_t len = std::min(PAYLOAD_PER_PAGE, _bufLen - off);
+    // Total bytes to read includes payload plus CRC32 plus writeSequenceId.
     size_t total = sizeof(uint32_t) + len + sizeof(uint32_t);
 
     uint8_t img[hwPageSizeBytes];
     if (_eeprom.read(img, _slotAddr(pageIndex, slot), total) != total) {
       return false;
     }
+    // Data format of the page image is [writeSeqId:4][payload:N][CRC32:4]
     uint32_t storedCrc;
     memcpy(&storedCrc, img + sizeof(uint32_t) + len, sizeof(uint32_t));
     if (computeCrc32(img, sizeof(uint32_t) + len) != storedCrc) {
@@ -262,11 +300,15 @@ private:
     size_t len = std::min(PAYLOAD_PER_PAGE, _bufLen - off);
     size_t total = sizeof(uint32_t) + len + sizeof(uint32_t);
 
+    // Data format of the page image is [writeSeqId:4][payload:N][CRC32:4]
     uint8_t img[hwPageSizeBytes];
-    memcpy(img, &seq, sizeof(uint32_t));
-    memcpy(img + sizeof(uint32_t), _buf + off, len);
+    uint8_t *cursor = img;
+    memcpy(cursor, &seq, sizeof(uint32_t));
+    cursor += sizeof(uint32_t);
+    memcpy(cursor, _buf + off, len);
+    cursor += len;
     uint32_t crc = computeCrc32(img, sizeof(uint32_t) + len);
-    memcpy(img + sizeof(uint32_t) + len, &crc, sizeof(uint32_t));
+    memcpy(cursor, &crc, sizeof(uint32_t));
 
     eeprom_addr_t addr = _slotAddr(pageIndex, slot);
     if (_eeprom.write(img, addr, total) != total) {
@@ -280,10 +322,26 @@ private:
   }
 
   GenericSpiEeprom &_eeprom;
+  /**
+   * Arbitrary data buffer backed by EEPROM and managed by this data structure.
+   *
+   * Each serialized copy may span multiple pages of EEPROM and have CRC32 and
+   * sequence id metadata interspersed with the real data, but the data is
+   * reconstituted as a single logical sequential array and stored here in _buf.
+   *
+   * The client of RedundantPagedStore has its own pointer to the same address
+   * as _buf and directly manipulates the data. The client is responsible for
+   * using markDirty() / markDirtyByteRange() after making any updates to the
+   * data in the buffer.
+   */
   uint8_t *_buf;
+  /** Number of bytes in _buf. */
   const size_t _bufLen;
+  /** Number of EEPROM pages occupied by one copy of the data. */
   const size_t _numPages;
+  /** Sequential page number in the EEPROM where copy A begins.  */
   const uint32_t _copyA;
+  /** Sequential page number in the EEPROM where copy B begins.  */
   const uint32_t _copyB;
 
   /** Newest known seqId of each table page. */
@@ -457,7 +515,9 @@ public:
 
   /** Return true if the page identified by pageNum is marked dead and should
    * not be used for storage. */
-  bool isPageDead(size_t pageNum) const override { return Base::isPageSet(pageNum); }
+  bool isPageDead(size_t pageNum) const override {
+    return Base::isPageSet(pageNum);
+  }
 
   bool isPageLive(size_t pageNum) const { return !Base::isPageSet(pageNum); }
 
@@ -606,12 +666,12 @@ public:
  *
  * The start-page array (n entries of `sizeof(addr_t)` bytes, indexed by record
  * id) is persisted crash-safely and in two redundant copies via a
- * `RedundantPagedStore`: copy A begins at hardware page `mapStartPageNum`, copy
- * B at `mapBStartPageNum`. Each serialized page carries its own seqId preamble
- * and CRC32 trailer (the engine versions every page independently, so a torn
- * update or a power loss leaves the previous good copy of every entry intact).
- * The size of each record (`sizeInPages()`) is not itself persisted; it is
- * purely an in-program convenience available to the records' allocator.
+ * `RedundantPagedStore`: copy A begins at hardware page `mapAStartPageNum`,
+ * copy B at `mapBStartPageNum`. Each serialized page carries its own seqId
+ * preamble and CRC32 trailer (the engine versions every page independently, so
+ * a torn update or a power loss leaves the previous good copy of every entry
+ * intact). The size of each record (`sizeInPages()`) is not itself persisted;
+ * it is purely an in-program convenience available to the records' allocator.
  */
 template <size_t hwPageSizeBytes> class DataMap {
 public:
@@ -619,16 +679,16 @@ public:
 
   /**
    * Create a DataMap tracking `numRecords` records, with its two redundant
-   * copies serialized starting at hardware pages `mapStartPageNum` (A) and
+   * copies serialized starting at hardware pages `mapAStartPageNum` (A) and
    * `mapBStartPageNum` (B).
    */
-  DataMap(GenericSpiEeprom &eeprom, addr_t mapStartPageNum,
-          addr_t mapBStartPageNum, const DataMappable *const *records,
-          size_t numRecords)
-      : _records(records), _numRecords(numRecords),
+  DataMap(GenericSpiEeprom &eeprom, addr_t mapAStartPageNum,
+          addr_t mapBStartPageNum, size_t numRecords)
+      : _numRecords(numRecords),
         _startPages(new addr_t[numRecords ? numRecords : 1]),
         _store(eeprom, reinterpret_cast<uint8_t *>(_startPages),
-               numRecords * sizeof(addr_t), mapStartPageNum, mapBStartPageNum) {
+               numRecords * sizeof(addr_t), mapAStartPageNum,
+               mapBStartPageNum) {
     memset(_startPages, 0, _numRecords * sizeof(addr_t));
   }
 
@@ -657,8 +717,8 @@ public:
    * persist. */
   void setStartPage(addr_t recordId, addr_t startPage) {
     _startPages[recordId] = startPage;
-    size_t firstByte = recordId * sizeof(addr_t);
-    _store.markDirtyByteRange(firstByte, firstByte + sizeof(addr_t) - 1);
+    size_t firstByteIdx = recordId * sizeof(addr_t);
+    _store.markDirtyByteRange(firstByteIdx, firstByteIdx + sizeof(addr_t) - 1);
   }
 
   /** Write only the dirty serialized page(s) back to the EEPROM (each to its
@@ -674,10 +734,10 @@ public:
   bool verify() const { return _store.verify(); }
 
 private:
-  /** The records this DataMap is responsible for tracking. */
-  const DataMappable *const *_records;
-
-  /** Number of records tracked (and length of the backing array). */
+  /**
+   * Number of records whose page offsets are tracked (length of _startPages
+   * backing array).
+   */
   const size_t _numRecords;
 
   /** In-memory copy of the start-page array, indexed by record id. Declared
@@ -1031,6 +1091,11 @@ public:
       return false;
     }
 
+    if (_deadList == nullptr) {
+      // Write fails because the page deadlist was not initialized first.
+      return false;
+    }
+
     uint32_t nextSeq;
     size_t startSlot;
     if (_currentSeq == 0) {
@@ -1043,7 +1108,7 @@ public:
 
     for (size_t attempt = 0; attempt < k; attempt++) {
       size_t slot = (startSlot + attempt) % k;
-      if (_deadList != nullptr && _deadList->isPageDead(_basePage + slot)) {
+      if (_deadList->isPageDead(_basePage + slot)) {
         continue;
       }
 
@@ -1053,11 +1118,11 @@ public:
         return true;
       }
 
-      if (_deadList != nullptr) {
-        _deadList->markPageDead(_basePage + slot);
-        if (_deadSlotCount() * 2 >= k) {
-          return false;
-        }
+      // If we get here, the write failed. Mark the page as dead and try again,
+      // assuming we have sufficient space still alive in which to re-attempt.
+      _deadList->markPageDead(_basePage + slot);
+      if (_deadSlotCount() * 2 >= k) {
+        return false;
       }
     }
 
@@ -1276,7 +1341,8 @@ public:
    * specifies a 5ms max write time; this allows generous margin. */
   static constexpr unsigned long WRITE_STALL_THRESHOLD_MILLIS = 20;
 
-  /** Root page is valid: magic, system version, and app version all check out. */
+  /** Root page is valid: magic, system version, and app version all check out.
+   */
   static constexpr int ROOT_PAGE_OK = 0;
   /** The root page failed to load (read error or CRC32 mismatch) -- the
    * EEPROM has likely never been formatted, or is corrupt. */
@@ -1289,7 +1355,8 @@ public:
   /** The root page's application format version doesn't match what the
    * application asked for in its EepromPageManager constructor. */
   static constexpr int ROOT_PAGE_ERR_BAD_APP_VERSION = -4;
-  /** The data map failed to load (no valid copy of one or more of its pages). */
+  /** The data map failed to load (no valid copy of one or more of its pages).
+   */
   static constexpr int ERR_DATA_MAP_CORRUPT = -5;
   /** A page bitmap (deadlist or usage list) failed to load. */
   static constexpr int ERR_BITMAP_CORRUPT = -6;
@@ -1305,7 +1372,7 @@ public:
         _deadList(eeprom, DEAD_LIST_PAGE_NUM, _deadListBPage(numRecords)),
         _usage(eeprom, USAGE_LIST_PAGE_NUM, _usageBPage(numRecords)),
         _dataMap(eeprom, DATA_MAP_START_PAGE_NUM, _dataMapBPage(numRecords),
-                 records, numRecords),
+                 numRecords),
         _rootPage(/*recordId=*/0, eeprom), _records(records),
         _numRecords(numRecords), _appFormatVersion(appFormatVersion),
         _firstDataPageNum(_firstDataPage(numRecords)) {}
@@ -1344,7 +1411,8 @@ public:
       }
 
       _usage.markSpanInUse(startPage, numPages, /*delayFlush=*/true);
-      _dataMap.setStartPage(record->getRecordId(), static_cast<addr_t>(startPage));
+      _dataMap.setStartPage(record->getRecordId(),
+                            static_cast<addr_t>(startPage));
       record->setPageNum(static_cast<addr_t>(startPage));
       nextSearch = startPage + numPages;
     }
@@ -1387,7 +1455,8 @@ public:
     }
 
     for (size_t i = 0; i < _numRecords; i++) {
-      _records[i]->setPageNum(_dataMap.getStartPage(_records[i]->getRecordId()));
+      _records[i]->setPageNum(
+          _dataMap.getStartPage(_records[i]->getRecordId()));
     }
 
     return ROOT_PAGE_OK;
@@ -1428,9 +1497,9 @@ public:
    *
    * NOTE: this advisory readback is meaningful only because write() today is
    * synchronous (the cell commit has completed by the time it returns). If/when
-   * write() becomes asynchronous -- letting the MCU proceed before the low-level
-   * flush completes -- a slow write would need its commit confirmed before this
-   * verify() could be trusted; revisit this path then.
+   * write() becomes asynchronous -- letting the MCU proceed before the
+   * low-level flush completes -- a slow write would need its commit confirmed
+   * before this verify() could be trusted; revisit this path then.
    *
    * Returns true iff `record` ends up durably (and verifiably) stored
    * somewhere.
@@ -1523,7 +1592,8 @@ private:
       size_t j = 0;
       for (; j < numPages; j++) {
         size_t p = candidate + j;
-        if (p >= _numPages || _usage.isPageInUse(p) || _deadList.isPageDead(p)) {
+        if (p >= _numPages || _usage.isPageInUse(p) ||
+            _deadList.isPageDead(p)) {
           break;
         }
       }
@@ -1579,7 +1649,8 @@ private:
     }
 
     // Commit: repoint the map at the verified new copy. This is the barrier.
-    _dataMap.setStartPage(record.getRecordId(), static_cast<addr_t>(newPageNum));
+    _dataMap.setStartPage(record.getRecordId(),
+                          static_cast<addr_t>(newPageNum));
     if (!_dataMap.flush()) {
       // The commit itself couldn't be verified; the redundant map preserved
       // the old pointer, so fall back to the old location.

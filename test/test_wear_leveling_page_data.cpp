@@ -57,8 +57,12 @@ TEST_CASE("a freshly placed (never-written) ring has no valid record") {
 
 TEST_CASE("the first store() lands at slot 0 with writeSequenceId 1") {
   FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
   Ring ring(/*recordId=*/0, eeprom);
   ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
 
   ring.data = Widget{1, 2};
   CHECK(ring.store() == true);
@@ -70,8 +74,12 @@ TEST_CASE("the first store() lands at slot 0 with writeSequenceId 1") {
 TEST_CASE("store() advances round-robin through all k slots in order, with "
           "writeSequenceId incrementing each time, then wraps back to slot 0") {
   FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
   Ring ring(/*recordId=*/0, eeprom);
   ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
 
   for (size_t i = 0; i < kRingSize * 2; i++) {
     ring.data = Widget{static_cast<uint32_t>(i), 0};
@@ -83,8 +91,12 @@ TEST_CASE("store() advances round-robin through all k slots in order, with "
 
 TEST_CASE("setPageNum() resets the ring's slot/sequence history") {
   FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
   Ring ring(/*recordId=*/0, eeprom);
   ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
   ring.data = Widget{1, 1};
   ring.store();
   ring.store();
@@ -105,8 +117,12 @@ TEST_CASE("load() after a reboot finds the most-recently-written slot, even with
   FakeEeprom eeprom(4096);
   Widget last{};
   {
+    DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+    deadList.formatNew();
+
     Ring writer(/*recordId=*/0, eeprom);
     writer.setPageNum(4);
+    writer.setDeadPageOracle(deadList);
     // k+2 stores: every slot has a valid CRC, and the ring has wrapped once.
     for (size_t i = 0; i < kRingSize + 2; i++) {
       writer.data = Widget{static_cast<uint32_t>(i), static_cast<int32_t>(i * 10)};
@@ -193,8 +209,12 @@ TEST_CASE("after a reboot, load() correctly finds the latest slot when only some
   FakeEeprom eeprom(4096);
 
   {
+    DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+    deadList.formatNew();
+
     Ring writer(/*recordId=*/0, eeprom);
     writer.setPageNum(4);
+    writer.setDeadPageOracle(deadList);
 
     // Only write 2 of the ring's 4 slots; slots 2 and 3 stay untouched, so
     // they still read back as FakeEeprom's factory-reset 0xFF fill --
