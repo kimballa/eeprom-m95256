@@ -350,6 +350,71 @@ TEST_CASE("storeRecord() returns false when no free page is available to relocat
   CHECK(mgr.deadList().isPageDead(oldPage));
 }
 
+TEST_CASE("a relocation whose data-map commit fails rolls the map's in-RAM entry "
+          "back to the old page, so a later flush of the shared map page can't "
+          "leak the abandoned new pointer to disk") {
+  // record 0 is a ring (so it relocates on wear-out, with its old data still
+  // intact -- no faulty old page needed); record 1 is an ordinary record that
+  // shares the same data-map page (6 entries per 24-byte map page here). We
+  // make only the map's commit write fail, and confirm record 0's pointer
+  // never ends up as the abandoned relocation target.
+  constexpr size_t kRingSize = 4;
+  using Ring = WearLevelingPageData<Widget, kPageSize, kRingSize>;
+
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  Ring ring(/*recordId=*/0, eeprom);
+  Record other(/*recordId=*/1, eeprom);
+  DataMappable *records[] = {&ring, &other};
+  TestMgr mgr(eeprom, records, 2, 1);
+  ring.setDeadPageOracle(mgr.deadList());
+
+  CHECK(mgr.formatNew() == true);
+  const Widget vOld{10, 100};
+  ring.data = vOld;
+  CHECK(mgr.storeRecord(ring) == true);
+  size_t oldBase = ring.getPageNum();
+
+  // Wear the ring out so the next store() relocates instead of writing in place.
+  mgr.deadList().markPageDead(oldBase + 1);
+  mgr.deadList().markPageDead(oldBase + 3);
+
+  // Make the data map's commit (a write to copy B) fail verification, while
+  // leaving the relocation's data write to the fresh ring untouched. Copy B of
+  // the map is the last system region, ending just before the first data page.
+  size_t mapBStart = mgr.firstDataPageNum() - mgr.dataMap().numMapPages();
+  eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>(mapBStart * kPageSize + 4));
+
+  ring.data = Widget{20, 200};
+  CHECK(mgr.storeRecord(ring) == false); // Relocation's commit failed.
+
+  // The fix: the map's in-RAM entry for record 0 was rolled back to oldBase
+  // (without it, this would still read the abandoned relocation target).
+  CHECK(mgr.dataMap().getStartPage(0) == oldBase);
+
+  // Now another record on the SAME map page gets updated and the page is
+  // flushed (here driven directly to stand in for a second relocation). With
+  // the rollback, record 0's reverted pointer is what lands -- not the
+  // abandoned new one.
+  eeprom.clearFaultyByte();
+  constexpr Record::addr_t kMarker = 999;
+  mgr.dataMap().setStartPage(1, kMarker);
+  CHECK(mgr.dataMap().flush());
+
+  // Reload from disk and confirm record 0 still maps to its old base.
+  Ring reloadRing(/*recordId=*/0, eeprom);
+  Record reloadOther(/*recordId=*/1, eeprom);
+  DataMappable *reloadRecords[] = {&reloadRing, &reloadOther};
+  TestMgr reloaded(eeprom, reloadRecords, 2, 1);
+  CHECK(reloaded.init() == TestMgr::ROOT_PAGE_OK);
+  CHECK(reloaded.dataMap().getStartPage(0) == oldBase);
+  CHECK(reloaded.dataMap().getStartPage(1) == kMarker);
+
+  // ...and the ring's old data is still recoverable from oldBase.
+  reloadRing.setPageNum(static_cast<Ring::addr_t>(oldBase));
+  CHECK(reloadRing.load() == true);
+  CHECK(reloadRing.data == vOld);
+}
+
 TEST_CASE("verifyAll() passes for a fully written store, and flags a corrupted "
           "record and a corrupted data map") {
   FakeEeprom eeprom(kBigEnoughPages * kPageSize);

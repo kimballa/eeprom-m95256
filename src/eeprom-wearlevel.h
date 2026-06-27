@@ -219,6 +219,18 @@ public:
    * Write every dirty page to its inactive slot (crash-safely, never touching
    * the active slot), bump that page's seqId, and clear its dirty flag.
    * Returns false if any page's write could not be verified.
+   *
+   * This is best-effort and report-once: even on a write failure the page's
+   * dirty flag is cleared (and its active slot left pointing at the last good
+   * copy), so the failure surfaces ONLY via this call's `false` return -- a
+   * later flushDirty() will see nothing dirty and return true. Callers must
+   * therefore treat a `false` return as terminal rather than retryable. For
+   * the system structures this engine backs, that's the right contract: their
+   * pages live at fixed addresses with no spare location, so a failed
+   * _writeSlot() is an unrecoverable bad-cell fault, not something a retry
+   * could fix. A caller that wants to abandon the in-RAM change on failure
+   * (e.g. EepromPageManager's relocation commit) must also roll its own
+   * in-RAM state back, rather than relying on the dropped dirty flag.
    */
   bool flushDirty() {
     bool ok = true;
@@ -1653,7 +1665,12 @@ private:
                           static_cast<addr_t>(newPageNum));
     if (!_dataMap.flush()) {
       // The commit itself couldn't be verified; the redundant map preserved
-      // the old pointer, so fall back to the old location.
+      // the old pointer on disk, so fall back to the old location. Roll the
+      // map's in-RAM entry back to match (and mark it dirty again), so a later
+      // flush can't push this abandoned new pointer to disk -- flushDirty()
+      // drops the dirty flag on failure, so we can't rely on it to suppress
+      // the abandoned write for us.
+      _dataMap.setStartPage(record.getRecordId(), oldPageNum);
       record.setPageNum(oldPageNum);
       return false;
     }

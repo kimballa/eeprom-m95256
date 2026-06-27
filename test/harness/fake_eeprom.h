@@ -104,6 +104,9 @@ public:
     _faultyByteSet = true;
   }
 
+  /** Clear a previously-set faulty byte, so writes to it stick again. */
+  void clearFaultyByte() { _faultyByteSet = false; }
+
 private:
   size_t available(addr_t addr, size_t count) const {
     if (addr >= _data.size()) {
