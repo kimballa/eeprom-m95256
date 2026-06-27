@@ -1,9 +1,11 @@
 // (c) Copyright 2026 Aaron Kimball
 //
 // Tests for EepromPageManager in src/eeprom-wearlevel.h: root-page
-// formatting/validation, initial page placement for a set of DataMappable
-// records, reload-time pageNum resync, and storeRecord()'s
-// detect-and-relocate behavior on a failed (mismatched or stalled) write.
+// formatting/validation, initial page placement, reload-time pageNum resync,
+// storeRecord()'s detect-and-relocate behavior (with the crash-safe write
+// ordering and don't-free-the-old-page policy), the slow-write advisory path,
+// verifyAll(), and power-loss recovery at every interruption point of
+// formatNew() and of a relocation.
 
 #include "doctest.h"
 
@@ -47,7 +49,8 @@ struct RecordSet {
 
 /** Directly craft and write a root page payload (with a correct CRC32
  * trailer) bypassing EepromPageManager, so tests can probe
- * checkRootPageValid()'s individual failure modes independently. */
+ * checkRootPageValid()'s individual failure modes independently. The root page
+ * is a single-copy PageBackedData at hardware page 0. */
 void writeRawRootPage(FakeEeprom &eeprom, const EepromRootPageData &rootData) {
   uint8_t buf[sizeof(EepromRootPageData) + sizeof(uint32_t)];
   memcpy(buf, &rootData, sizeof(rootData));
@@ -56,43 +59,37 @@ void writeRawRootPage(FakeEeprom &eeprom, const EepromRootPageData &rootData) {
   eeprom.write(buf, 0, sizeof(buf));
 }
 
-/** Number of pages needed for `numMapPages` to be 1 in all these tests: a
- * handful of single-page records easily fit in one chunk page. With
- * kPageSize=32, _bytesPerMapPage=28, so up to 14 records fit in one map
- * page -- well above what any test below needs. firstDataPageNum is
- * therefore always DATA_MAP_START_PAGE_NUM (3) + 1 = 4. */
-constexpr size_t kFirstDataPageNum = 4;
-
-template <size_t numPages> using Mgr = EepromPageManager<numPages * kPageSize * 8, kPageSize>;
+// A roomy EEPROM (plenty of pages past firstDataPageNum) for the small tests.
+constexpr size_t kBigEnoughPages = 40;
+template <size_t numPages>
+using Mgr = EepromPageManager<numPages * kPageSize * 8, kPageSize>;
+using TestMgr = Mgr<kBigEnoughPages>;
 
 } // namespace
 
 TEST_SUITE("EepromPageManager") {
 
 TEST_CASE("ROOT_PAGE_MAGIC matches the specified constant") {
-  CHECK(Mgr<8>::ROOT_PAGE_MAGIC == 0x0571AC94);
-  CHECK(Mgr<8>::SYSTEM_FORMAT_VERSION == 1);
+  CHECK(TestMgr::ROOT_PAGE_MAGIC == 0x0571AC94);
+  CHECK(TestMgr::SYSTEM_FORMAT_VERSION == 1);
 }
 
 TEST_CASE("formatNew() makes the root page valid and reports it via checkRootPageValid()") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 2;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 2);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), /*appFormatVersion=*/7);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), /*appFormatVersion=*/7);
 
   CHECK(mgr.formatNew() == true);
-  CHECK(mgr.checkRootPageValid() == Mgr<kNumPages>::ROOT_PAGE_OK);
+  CHECK(mgr.checkRootPageValid() == TestMgr::ROOT_PAGE_OK);
 }
 
 TEST_CASE("formatNew() assigns each record a unique page at/after firstDataPageNum, "
           "marked in-use, and reflected in the data map") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 5;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 5);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 7);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 7);
 
   CHECK(mgr.formatNew() == true);
-  CHECK(mgr.firstDataPageNum() == kFirstDataPageNum);
 
   std::set<size_t> seenPages;
   for (auto *rec : recs.ptrs) {
@@ -104,11 +101,10 @@ TEST_CASE("formatNew() assigns each record a unique page at/after firstDataPageN
   }
 }
 
-TEST_CASE("formatNew() reserves the root/deadlist/usage/data-map pages as in-use") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 1;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+TEST_CASE("formatNew() reserves every system page (root + both A/B copies) as in-use") {
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 1);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
 
   CHECK(mgr.formatNew() == true);
   for (size_t p = 0; p < mgr.firstDataPageNum(); p++) {
@@ -117,126 +113,147 @@ TEST_CASE("formatNew() reserves the root/deadlist/usage/data-map pages as in-use
 }
 
 TEST_CASE("formatNew() returns false when there isn't enough free space for every record") {
-  // One page short of what 5 single-page records need.
-  constexpr size_t kNumPages = kFirstDataPageNum + 4;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  // firstDataPageNum is 7 for this config; with 4 data pages (11 total) there
+  // is not room for 5 single-page records.
+  FakeEeprom eeprom(11 * kPageSize);
   RecordSet recs(eeprom, 5);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  Mgr<11> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
 
+  CHECK(mgr.firstDataPageNum() == 7);
   CHECK(mgr.formatNew() == false);
 }
 
 TEST_CASE("checkRootPageValid()/init() report ROOT_PAGE_ERR_LOAD_FAILED on a "
           "never-formatted (factory-reset, all-0xFF) EEPROM") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 2;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 2);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
 
-  CHECK(mgr.checkRootPageValid() == Mgr<kNumPages>::ROOT_PAGE_ERR_LOAD_FAILED);
-  CHECK(mgr.init() == Mgr<kNumPages>::ROOT_PAGE_ERR_LOAD_FAILED);
+  CHECK(mgr.checkRootPageValid() == TestMgr::ROOT_PAGE_ERR_LOAD_FAILED);
+  CHECK(mgr.init() == TestMgr::ROOT_PAGE_ERR_LOAD_FAILED);
 }
 
 TEST_CASE("checkRootPageValid() reports ROOT_PAGE_ERR_BAD_MAGIC for a structurally "
           "valid page with the wrong magic number") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 2;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 2);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 9);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 9);
 
   EepromRootPageData rootData{};
   rootData.magic = 0xDEADBEEF;
-  rootData.systemVersion = Mgr<kNumPages>::SYSTEM_FORMAT_VERSION;
+  rootData.systemVersion = TestMgr::SYSTEM_FORMAT_VERSION;
   rootData.appVersion = 9;
   writeRawRootPage(eeprom, rootData);
 
-  CHECK(mgr.checkRootPageValid() == Mgr<kNumPages>::ROOT_PAGE_ERR_BAD_MAGIC);
+  CHECK(mgr.checkRootPageValid() == TestMgr::ROOT_PAGE_ERR_BAD_MAGIC);
 }
 
 TEST_CASE("checkRootPageValid() reports ROOT_PAGE_ERR_BAD_SYSTEM_VERSION for an "
           "unrecognized system format version") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 2;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 2);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 9);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 9);
 
   EepromRootPageData rootData{};
-  rootData.magic = Mgr<kNumPages>::ROOT_PAGE_MAGIC;
-  rootData.systemVersion = Mgr<kNumPages>::SYSTEM_FORMAT_VERSION + 1;
+  rootData.magic = TestMgr::ROOT_PAGE_MAGIC;
+  rootData.systemVersion = TestMgr::SYSTEM_FORMAT_VERSION + 1;
   rootData.appVersion = 9;
   writeRawRootPage(eeprom, rootData);
 
-  CHECK(mgr.checkRootPageValid() == Mgr<kNumPages>::ROOT_PAGE_ERR_BAD_SYSTEM_VERSION);
+  CHECK(mgr.checkRootPageValid() == TestMgr::ROOT_PAGE_ERR_BAD_SYSTEM_VERSION);
 }
 
 TEST_CASE("checkRootPageValid()/init() report ROOT_PAGE_ERR_BAD_APP_VERSION when the "
           "stored app version doesn't match what the application expects") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 2;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   {
     RecordSet recs(eeprom, 2);
-    Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), /*appFormatVersion=*/5);
+    TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), /*appFormatVersion=*/5);
     CHECK(mgr.formatNew() == true);
   }
 
   RecordSet recs(eeprom, 2);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), /*appFormatVersion=*/6);
-  CHECK(mgr.checkRootPageValid() == Mgr<kNumPages>::ROOT_PAGE_ERR_BAD_APP_VERSION);
-  CHECK(mgr.init() == Mgr<kNumPages>::ROOT_PAGE_ERR_BAD_APP_VERSION);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), /*appFormatVersion=*/6);
+  CHECK(mgr.checkRootPageValid() == TestMgr::ROOT_PAGE_ERR_BAD_APP_VERSION);
+  CHECK(mgr.init() == TestMgr::ROOT_PAGE_ERR_BAD_APP_VERSION);
 }
 
-TEST_CASE("init() reports ERR_DATA_MAP_CORRUPT when a data-map page's CRC32 doesn't match") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 2;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+TEST_CASE("init() recovers a data map whose ONE redundant copy is corrupt, but "
+          "reports ERR_DATA_MAP_CORRUPT when BOTH copies of a page are corrupt") {
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   {
     RecordSet recs(eeprom, 2);
-    Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+    TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
     CHECK(mgr.formatNew() == true);
   }
 
-  // Flip a bit inside the data map's serialized page without fixing up its CRC32.
-  eeprom.byteAt(Mgr<kNumPages>::DATA_MAP_START_PAGE_NUM * kPageSize) ^= 0x01;
+  // Corrupt copy A of the data map's first page; copy B still validates.
+  eeprom.byteAt(TestMgr::DATA_MAP_START_PAGE_NUM * kPageSize + 4) ^= 0x01;
+  {
+    RecordSet recs(eeprom, 2);
+    TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+    CHECK(mgr.init() == TestMgr::ROOT_PAGE_OK); // Recovered from copy B.
+  }
+
+  // Now corrupt copy B's first page too: no valid copy remains. Copy B of the
+  // map is the last system region, ending just before the first data page.
+  RecordSet recs(eeprom, 2);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  size_t mapBStart = mgr.firstDataPageNum() - mgr.dataMap().numMapPages();
+  eeprom.byteAt(mapBStart * kPageSize + 4) ^= 0x01;
+  CHECK(mgr.init() == TestMgr::ERR_DATA_MAP_CORRUPT);
+}
+
+TEST_CASE("init() reports ERR_BITMAP_CORRUPT when both copies of the deadlist are bad") {
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  {
+    RecordSet recs(eeprom, 2);
+    TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+    CHECK(mgr.formatNew() == true);
+  }
+
+  // Copy A of the deadlist is at DEAD_LIST_PAGE_NUM; copy B starts right after
+  // copy A of the data map.
+  size_t deadB = TestMgr::DATA_MAP_START_PAGE_NUM + 1; // 1 map page in this config.
+  eeprom.byteAt(TestMgr::DEAD_LIST_PAGE_NUM * kPageSize + 4) ^= 0x01;
+  eeprom.byteAt(deadB * kPageSize + 4) ^= 0x01;
 
   RecordSet recs(eeprom, 2);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
-  CHECK(mgr.init() == Mgr<kNumPages>::ERR_DATA_MAP_CORRUPT);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  CHECK(mgr.init() == TestMgr::ERR_BITMAP_CORRUPT);
 }
 
 TEST_CASE("init() resyncs each known record's pageNum from the reloaded data map, "
           "surviving a simulated power cycle, without loading record data") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 3;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   std::vector<Record::addr_t> assignedPages;
   {
     RecordSet recs(eeprom, 3);
-    Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 42);
+    TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 42);
     CHECK(mgr.formatNew() == true);
     for (auto *rec : recs.ptrs) {
       assignedPages.push_back(rec->getPageNum());
     }
   }
 
-  // A fresh set of record objects, as if after a reboot: pageNum defaults to 0.
   RecordSet recs(eeprom, 3);
   for (auto *rec : recs.ptrs) {
     CHECK(rec->getPageNum() == 0);
   }
 
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 42);
-  CHECK(mgr.init() == Mgr<kNumPages>::ROOT_PAGE_OK);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 42);
+  CHECK(mgr.init() == TestMgr::ROOT_PAGE_OK);
 
   for (size_t i = 0; i < recs.ptrs.size(); i++) {
     CHECK(recs.ptrs[i]->getPageNum() == assignedPages[i]);
-    // init() does not auto-load record data: it's still default-constructed.
-    CHECK(recs.records[i]->data == Widget{});
+    CHECK(recs.records[i]->data == Widget{}); // init() does not auto-load data.
   }
 }
 
 TEST_CASE("storeRecord() persists data without relocating on a clean write") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 2;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 2);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
   CHECK(mgr.formatNew() == true);
 
   Record &rec = *recs.records[0];
@@ -244,7 +261,7 @@ TEST_CASE("storeRecord() persists data without relocating on a clean write") {
   size_t originalPage = rec.getPageNum();
 
   CHECK(mgr.storeRecord(rec) == true);
-  CHECK(rec.getPageNum() == originalPage); // No relocation occurred.
+  CHECK(rec.getPageNum() == originalPage);
   CHECK(mgr.deadList().isPageLive(originalPage));
 
   Record reloaded(rec.getRecordId(), eeprom);
@@ -253,19 +270,17 @@ TEST_CASE("storeRecord() persists data without relocating on a clean write") {
   CHECK(reloaded.data == rec.data);
 }
 
-TEST_CASE("storeRecord() relocates a record when the write fails its readback verification") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 3;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+TEST_CASE("storeRecord() relocates on a failed readback, marking the old page dead "
+          "but leaving it in-use (never freed)") {
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 1);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
   CHECK(mgr.formatNew() == true);
 
   Record &rec = *recs.records[0];
   rec.data = Widget{1, 2};
   size_t oldPage = rec.getPageNum();
 
-  // Simulate a bad cell: any write touching the old page's first byte gets
-  // silently corrupted, so PageBackedData::store()'s readback will disagree.
   eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>(oldPage * kPageSize));
 
   CHECK(mgr.storeRecord(rec) == true); // Succeeds after relocating elsewhere.
@@ -273,7 +288,7 @@ TEST_CASE("storeRecord() relocates a record when the write fails its readback ve
   size_t newPage = rec.getPageNum();
   CHECK(newPage != oldPage);
   CHECK(mgr.deadList().isPageDead(oldPage));
-  CHECK(mgr.usage().isPageFree(oldPage));
+  CHECK(mgr.usage().isPageInUse(oldPage)); // NOT freed: a dead page stays reserved.
   CHECK(mgr.usage().isPageInUse(newPage));
   CHECK(mgr.dataMap().getStartPage(rec.getRecordId()) == newPage);
 
@@ -283,11 +298,10 @@ TEST_CASE("storeRecord() relocates a record when the write fails its readback ve
   CHECK(reloaded.data == rec.data);
 }
 
-TEST_CASE("storeRecord() relocates a record when the write stalls past the threshold") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 3;
-  FakeEeprom eeprom(kNumPages * kPageSize);
+TEST_CASE("storeRecord() does NOT relocate on a merely-slow (but verifiable) write") {
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 1);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
   CHECK(mgr.formatNew() == true);
 
   Record &rec = *recs.records[0];
@@ -295,41 +309,37 @@ TEST_CASE("storeRecord() relocates a record when the write stalls past the thres
   size_t oldPage = rec.getPageNum();
 
   resetFakeMillis();
-  eeprom.setWriteDelayMillis(Mgr<kNumPages>::WRITE_STALL_THRESHOLD_MILLIS + 5);
+  eeprom.setWriteDelayMillis(TestMgr::WRITE_STALL_THRESHOLD_MILLIS + 5);
 
   CHECK(mgr.storeRecord(rec) == true);
-  CHECK(rec.getPageNum() != oldPage);
-  CHECK(mgr.deadList().isPageDead(oldPage));
-
-  Record reloaded(rec.getRecordId(), eeprom);
-  reloaded.setPageNum(rec.getPageNum());
-  CHECK(reloaded.load() == true);
-  CHECK(reloaded.data == rec.data);
+  // The slow write was correct, so the advisory readback passes and the
+  // record stays put -- no page is condemned.
+  CHECK(rec.getPageNum() == oldPage);
+  CHECK(mgr.deadList().isPageLive(oldPage));
 }
 
 TEST_CASE("storeRecord() relocation skips over pages already marked dead") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 3; // data pages: 4, 5, 6.
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
   RecordSet recs(eeprom, 1);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
   CHECK(mgr.formatNew() == true);
 
   Record &rec = *recs.records[0];
   size_t oldPage = rec.getPageNum();
-  CHECK(oldPage == kFirstDataPageNum); // The only record, so it gets the first data page.
+  CHECK(oldPage == mgr.firstDataPageNum());
 
-  mgr.deadList().markPageDead(kFirstDataPageNum + 1); // Pre-mark the next page dead.
+  mgr.deadList().markPageDead(oldPage + 1); // Pre-mark the next page dead.
   eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>(oldPage * kPageSize));
 
   CHECK(mgr.storeRecord(rec) == true);
-  CHECK(rec.getPageNum() == kFirstDataPageNum + 2); // +1 was skipped because it's dead.
+  CHECK(rec.getPageNum() == oldPage + 2); // +1 was skipped because it's dead.
 }
 
 TEST_CASE("storeRecord() returns false when no free page is available to relocate to") {
-  constexpr size_t kNumPages = kFirstDataPageNum + 1; // Exactly one data page, no spares.
-  FakeEeprom eeprom(kNumPages * kPageSize);
+  // Exactly one data page (firstDataPageNum == 7, total 8 pages).
+  FakeEeprom eeprom(8 * kPageSize);
   RecordSet recs(eeprom, 1);
-  Mgr<kNumPages> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  Mgr<8> mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
   CHECK(mgr.formatNew() == true);
 
   Record &rec = *recs.records[0];
@@ -337,29 +347,118 @@ TEST_CASE("storeRecord() returns false when no free page is available to relocat
   eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>(oldPage * kPageSize));
 
   CHECK(mgr.storeRecord(rec) == false);
-  // The old page is still marked dead, even though relocation itself failed.
   CHECK(mgr.deadList().isPageDead(oldPage));
 }
 
+TEST_CASE("a relocation whose data-map commit fails rolls the map's in-RAM entry "
+          "back to the old page, so a later flush of the shared map page can't "
+          "leak the abandoned new pointer to disk") {
+  // record 0 is a ring (so it relocates on wear-out, with its old data still
+  // intact -- no faulty old page needed); record 1 is an ordinary record that
+  // shares the same data-map page (6 entries per 24-byte map page here). We
+  // make only the map's commit write fail, and confirm record 0's pointer
+  // never ends up as the abandoned relocation target.
+  constexpr size_t kRingSize = 4;
+  using Ring = WearLevelingPageData<Widget, kPageSize, kRingSize>;
+
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  Ring ring(/*recordId=*/0, eeprom);
+  Record other(/*recordId=*/1, eeprom);
+  DataMappable *records[] = {&ring, &other};
+  TestMgr mgr(eeprom, records, 2, 1);
+  ring.setDeadPageOracle(mgr.deadList());
+
+  CHECK(mgr.formatNew() == true);
+  const Widget vOld{10, 100};
+  ring.data = vOld;
+  CHECK(mgr.storeRecord(ring) == true);
+  size_t oldBase = ring.getPageNum();
+
+  // Wear the ring out so the next store() relocates instead of writing in place.
+  mgr.deadList().markPageDead(oldBase + 1);
+  mgr.deadList().markPageDead(oldBase + 3);
+
+  // Make the data map's commit (a write to copy B) fail verification, while
+  // leaving the relocation's data write to the fresh ring untouched. Copy B of
+  // the map is the last system region, ending just before the first data page.
+  size_t mapBStart = mgr.firstDataPageNum() - mgr.dataMap().numMapPages();
+  eeprom.setFaultyByte(static_cast<FakeEeprom::addr_t>(mapBStart * kPageSize + 4));
+
+  ring.data = Widget{20, 200};
+  CHECK(mgr.storeRecord(ring) == false); // Relocation's commit failed.
+
+  // The fix: the map's in-RAM entry for record 0 was rolled back to oldBase
+  // (without it, this would still read the abandoned relocation target).
+  CHECK(mgr.dataMap().getStartPage(0) == oldBase);
+
+  // Now another record on the SAME map page gets updated and the page is
+  // flushed (here driven directly to stand in for a second relocation). With
+  // the rollback, record 0's reverted pointer is what lands -- not the
+  // abandoned new one.
+  eeprom.clearFaultyByte();
+  constexpr Record::addr_t kMarker = 999;
+  mgr.dataMap().setStartPage(1, kMarker);
+  CHECK(mgr.dataMap().flush());
+
+  // Reload from disk and confirm record 0 still maps to its old base.
+  Ring reloadRing(/*recordId=*/0, eeprom);
+  Record reloadOther(/*recordId=*/1, eeprom);
+  DataMappable *reloadRecords[] = {&reloadRing, &reloadOther};
+  TestMgr reloaded(eeprom, reloadRecords, 2, 1);
+  CHECK(reloaded.init() == TestMgr::ROOT_PAGE_OK);
+  CHECK(reloaded.dataMap().getStartPage(0) == oldBase);
+  CHECK(reloaded.dataMap().getStartPage(1) == kMarker);
+
+  // ...and the ring's old data is still recoverable from oldBase.
+  reloadRing.setPageNum(static_cast<Ring::addr_t>(oldBase));
+  CHECK(reloadRing.load() == true);
+  CHECK(reloadRing.data == vOld);
+}
+
+TEST_CASE("verifyAll() passes for a fully written store, and flags a corrupted "
+          "record and a corrupted data map") {
+  FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+  RecordSet recs(eeprom, 2);
+  TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+  CHECK(mgr.formatNew() == true);
+
+  recs.records[0]->data = Widget{1, 1};
+  recs.records[1]->data = Widget{2, 2};
+  CHECK(mgr.storeRecord(*recs.records[0]) == true);
+  CHECK(mgr.storeRecord(*recs.records[1]) == true);
+
+  EepromVerifyResult good = mgr.verifyAll();
+  CHECK(good.ok);
+  CHECK(good.numBadRecords == 0);
+
+  // Corrupt record 0's data page.
+  eeprom.byteAt(recs.records[0]->getPageNum() * kPageSize) ^= 0xFF;
+  EepromVerifyResult bad = mgr.verifyAll();
+  CHECK_FALSE(bad.ok);
+  CHECK(bad.numBadRecords == 1);
+  CHECK(bad.dataMapOk); // Map itself is still fine.
+
+  // Corrupt both copies of the data map's first page too.
+  size_t mapBStart = mgr.firstDataPageNum() - mgr.dataMap().numMapPages();
+  eeprom.byteAt(TestMgr::DATA_MAP_START_PAGE_NUM * kPageSize + 4) ^= 0x01;
+  eeprom.byteAt(mapBStart * kPageSize + 4) ^= 0x01;
+  EepromVerifyResult worse = mgr.verifyAll();
+  CHECK_FALSE(worse.dataMapOk);
+}
+
 TEST_CASE("a large EEPROM whose deadlist/usage list each span multiple hardware "
-          "pages places the usage list and data map correctly, with no overlap "
-          "between system structures") {
-  // 1 MiB EEPROM, 64-byte pages -> 16384 total pages. An EepromPageBitmap
-  // covering 16384 pages needs a (16384/8)=2048-byte table, which spans
-  // ceil(2048/64)=32 hardware pages -- not the single page that fits a
-  // small test EEPROM's deadlist/usage list.
+          "pages lays out both A and B copies without overlap") {
   constexpr size_t kBitSize = 1024UL * 1024 * 8;
   constexpr size_t kHwPageSize = 64;
   using BigMgr = EepromPageManager<kBitSize, kHwPageSize>;
   using BigRecord = PageBackedData<Widget, kHwPageSize>;
 
-  CHECK(BigMgr::ROOT_PAGE_NUM == 0);
+  // 16384 pages -> 2048-byte bitmap table -> payload 56 -> 37 pages per copy.
   CHECK(BigMgr::DEAD_LIST_PAGE_NUM == 1);
-  CHECK(BigMgr::USAGE_LIST_PAGE_NUM == 33);     // 1 + 32 deadlist pages.
-  CHECK(BigMgr::DATA_MAP_START_PAGE_NUM == 65); // 33 + 32 usage-list pages.
+  CHECK(BigMgr::USAGE_LIST_PAGE_NUM == 38);      // 1 + 37 deadlist pages.
+  CHECK(BigMgr::DATA_MAP_START_PAGE_NUM == 75);  // 38 + 37 usage pages.
 
   FakeEeprom eeprom(1024UL * 1024);
-
   auto makeRecords = [&eeprom]() {
     std::vector<std::unique_ptr<BigRecord>> records;
     std::vector<DataMappable *> ptrs;
@@ -380,13 +479,11 @@ TEST_CASE("a large EEPROM whose deadlist/usage list each span multiple hardware 
   for (auto *rec : ptrs) {
     size_t p = rec->getPageNum();
     CHECK(p >= mgr.firstDataPageNum());
-    CHECK(seenPages.insert(p).second); // No two records share a page.
+    CHECK(seenPages.insert(p).second);
   }
 
-  // Exercise pages far out in the deadlist/usage bitmaps -- ones that live in
-  // a later hardware page of each multi-page table -- and confirm they
-  // round-trip across a simulated reboot without disturbing the root page,
-  // each other, or the data map.
+  // Exercise pages far out in the multi-page bitmaps and confirm they
+  // round-trip across a reboot.
   constexpr size_t kFarPage = 16000;
   mgr.deadList().markPageDead(kFarPage);
   mgr.usage().markPageInUse(kFarPage + 1);
@@ -399,6 +496,131 @@ TEST_CASE("a large EEPROM whose deadlist/usage list each span multiple hardware 
 
   for (size_t i = 0; i < ptrs.size(); i++) {
     CHECK(reloadPtrs[i]->getPageNum() == ptrs[i]->getPageNum());
+  }
+}
+
+TEST_CASE("formatNew() is crash-safe: a power loss at ANY write leaves the EEPROM "
+          "either fully formatted or unformatted, never half-valid-but-trusted") {
+  // Reference: a clean format, to know the deterministic placement and the
+  // total number of page writes involved.
+  std::vector<Record::addr_t> refPages;
+  size_t totalWrites = 0;
+  {
+    FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+    RecordSet recs(eeprom, 3);
+    TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+    eeprom.resetWriteCount();
+    CHECK(mgr.formatNew() == true);
+    totalWrites = eeprom.writeCount();
+    for (auto *rec : recs.ptrs) {
+      refPages.push_back(rec->getPageNum());
+    }
+  }
+  CHECK(totalWrites > 0);
+
+  for (size_t k = 1; k <= totalWrites + 1; k++) {
+    for (size_t partial : {size_t(0), size_t(8)}) {
+      FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+      {
+        RecordSet recs(eeprom, 3);
+        TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+        eeprom.resetWriteCount();
+        eeprom.armPowerLoss(k, partial);
+        mgr.formatNew(); // May complete, return false, or be cut short.
+      }
+
+      // Reboot and inspect.
+      RecordSet recs(eeprom, 3);
+      TestMgr mgr(eeprom, recs.ptrs.data(), recs.ptrs.size(), 1);
+      int status = mgr.init();
+      if (status == TestMgr::ROOT_PAGE_OK) {
+        // Root written last => a valid root implies a complete, consistent
+        // format: structures verify and placement matches the clean run.
+        EepromVerifyResult v = mgr.verifyAll();
+        CHECK(v.deadListOk);
+        CHECK(v.usageOk);
+        CHECK(v.dataMapOk);
+        for (size_t i = 0; i < recs.ptrs.size(); i++) {
+          CHECK(recs.ptrs[i]->getPageNum() == refPages[i]);
+        }
+      }
+      // Otherwise the device simply looks unformatted -- acceptable.
+    }
+  }
+}
+
+TEST_CASE("a record's data is never lost when a worn-out ring's relocation is "
+          "interrupted by a power loss at ANY write") {
+  // A WearLevelingPageData ring keeps its current value in a still-valid slot
+  // even once it's worn out, so (unlike a bad-cell-triggered relocation) the
+  // old copy is intact when relocation begins. Crash at any write during the
+  // relocating storeRecord() and confirm the record reloads SOME valid value
+  // (old or new) -- never neither -- with the metadata self-consistent.
+  constexpr size_t kRingSize = 4;
+  using Ring = WearLevelingPageData<Widget, kPageSize, kRingSize>;
+
+  const Widget vOld{10, 100};
+  const Widget vNew{20, 200};
+
+  // Find how many writes the relocating storeRecord() takes (clean run).
+  size_t relocateWrites = 0;
+  {
+    FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+    Ring ring(/*recordId=*/0, eeprom);
+    DataMappable *records[] = {&ring};
+    TestMgr mgr(eeprom, records, 1, 1);
+    ring.setDeadPageOracle(mgr.deadList());
+    CHECK(mgr.formatNew() == true);
+    ring.data = vOld;
+    CHECK(mgr.storeRecord(ring) == true);
+    size_t base = ring.getPageNum();
+    mgr.deadList().markPageDead(base + 1);
+    mgr.deadList().markPageDead(base + 3); // Half dead: next store relocates.
+    ring.data = vNew;
+    eeprom.resetWriteCount();
+    CHECK(mgr.storeRecord(ring) == true);
+    relocateWrites = eeprom.writeCount();
+  }
+  CHECK(relocateWrites > 0);
+
+  for (size_t k = 1; k <= relocateWrites; k++) {
+    for (size_t partial : {size_t(0), size_t(8)}) {
+      FakeEeprom eeprom(kBigEnoughPages * kPageSize);
+      size_t oldBase = 0;
+      {
+        Ring ring(/*recordId=*/0, eeprom);
+        DataMappable *records[] = {&ring};
+        TestMgr mgr(eeprom, records, 1, 1);
+        ring.setDeadPageOracle(mgr.deadList());
+        CHECK(mgr.formatNew() == true);
+        ring.data = vOld;
+        CHECK(mgr.storeRecord(ring) == true);
+        oldBase = ring.getPageNum();
+        mgr.deadList().markPageDead(oldBase + 1);
+        mgr.deadList().markPageDead(oldBase + 3);
+
+        ring.data = vNew;
+        eeprom.resetWriteCount();
+        eeprom.armPowerLoss(k, partial);
+        mgr.storeRecord(ring); // Interrupted somewhere in here.
+      }
+
+      // Reboot: reload the manager and the ring, then load the record.
+      Ring ring(/*recordId=*/0, eeprom);
+      DataMappable *records[] = {&ring};
+      TestMgr mgr(eeprom, records, 1, 1);
+      ring.setDeadPageOracle(mgr.deadList());
+      CHECK(mgr.init() == TestMgr::ROOT_PAGE_OK);
+
+      // Metadata must always be self-consistent after the interruption.
+      CHECK(mgr.deadList().verify());
+      CHECK(mgr.usage().verify());
+      CHECK(mgr.dataMap().verify());
+
+      // The record must reload SOME valid value -- old or new, never lost.
+      CHECK(ring.load() == true);
+      CHECK((ring.data == vOld || ring.data == vNew));
+    }
   }
 }
 

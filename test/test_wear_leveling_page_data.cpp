@@ -28,6 +28,10 @@ struct Widget {
 
 using Ring = WearLevelingPageData<Widget, kPageSize, kRingSize>;
 using DeadList = WearLevelDeadList<64 * kPageSize * 8, kPageSize>;
+// A 64-page deadlist needs an 8-byte table, which fits one serialized page per
+// copy (payload kPageSize-8 == 24 bytes); place copy B one page past copy A.
+constexpr size_t kDeadListCopyA = 0;
+constexpr size_t kDeadListCopyB = 1;
 
 } // namespace
 
@@ -53,8 +57,12 @@ TEST_CASE("a freshly placed (never-written) ring has no valid record") {
 
 TEST_CASE("the first store() lands at slot 0 with writeSequenceId 1") {
   FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
   Ring ring(/*recordId=*/0, eeprom);
   ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
 
   ring.data = Widget{1, 2};
   CHECK(ring.store() == true);
@@ -66,8 +74,12 @@ TEST_CASE("the first store() lands at slot 0 with writeSequenceId 1") {
 TEST_CASE("store() advances round-robin through all k slots in order, with "
           "writeSequenceId incrementing each time, then wraps back to slot 0") {
   FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
   Ring ring(/*recordId=*/0, eeprom);
   ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
 
   for (size_t i = 0; i < kRingSize * 2; i++) {
     ring.data = Widget{static_cast<uint32_t>(i), 0};
@@ -79,8 +91,12 @@ TEST_CASE("store() advances round-robin through all k slots in order, with "
 
 TEST_CASE("setPageNum() resets the ring's slot/sequence history") {
   FakeEeprom eeprom(4096);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+  deadList.formatNew();
+
   Ring ring(/*recordId=*/0, eeprom);
   ring.setPageNum(4);
+  ring.setDeadPageOracle(deadList);
   ring.data = Widget{1, 1};
   ring.store();
   ring.store();
@@ -101,8 +117,12 @@ TEST_CASE("load() after a reboot finds the most-recently-written slot, even with
   FakeEeprom eeprom(4096);
   Widget last{};
   {
+    DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+    deadList.formatNew();
+
     Ring writer(/*recordId=*/0, eeprom);
     writer.setPageNum(4);
+    writer.setDeadPageOracle(deadList);
     // k+2 stores: every slot has a valid CRC, and the ring has wrapped once.
     for (size_t i = 0; i < kRingSize + 2; i++) {
       writer.data = Widget{static_cast<uint32_t>(i), static_cast<int32_t>(i * 10)};
@@ -149,14 +169,52 @@ TEST_CASE("load() correctly disambiguates a writeSequenceId that has wrapped fro
   CHECK(ring.currentWriteSeqId() == 1);
 }
 
+TEST_CASE("load() disambiguates a wrap even when the literal UINT32_MAX slot has "
+          "already been overwritten, leaving only near-max pre-wrap values") {
+  // When dead-slot skipping means slots aren't overwritten in strict ring
+  // order, the slot that held the exact UINT32_MAX can be recycled before the
+  // other pre-wrap slots. The wrap heuristic keys off the whole top-k band
+  // (any seq within k of UINT32_MAX), not just the literal max, so it still
+  // recognizes this as a wrap and picks the small post-wrap winner.
+  FakeEeprom eeprom(4096);
+  Ring ring(/*recordId=*/0, eeprom);
+  ring.setPageNum(4);
+
+  auto writeRaw = [&](size_t slot, uint32_t seq, const Widget &w) {
+    uint8_t buf[sizeof(uint32_t) + sizeof(Widget) + sizeof(uint32_t)];
+    memcpy(buf, &seq, sizeof(seq));
+    memcpy(buf + sizeof(seq), &w, sizeof(w));
+    uint32_t crc = computeCrc32(buf, sizeof(seq) + sizeof(w));
+    memcpy(buf + sizeof(seq) + sizeof(w), &crc, sizeof(crc));
+    eeprom.write(buf, static_cast<FakeEeprom::addr_t>((4 + slot) * kPageSize),
+                 sizeof(buf));
+  };
+
+  // No slot holds the literal UINT32_MAX, but three hold near-max pre-wrap
+  // values; slot 1 holds the post-wrap winner (seq 2).
+  writeRaw(0, UINT32_MAX - 1, Widget{91, 91});
+  writeRaw(1, 2, Widget{2, 2}); // The real winner.
+  writeRaw(2, UINT32_MAX - 2, Widget{92, 92});
+  writeRaw(3, UINT32_MAX - 3, Widget{93, 93});
+
+  CHECK(ring.load() == true);
+  CHECK(ring.data == (Widget{2, 2}));
+  CHECK(ring.currentSlot() == 1);
+  CHECK(ring.currentWriteSeqId() == 2);
+}
+
 TEST_CASE("after a reboot, load() correctly finds the latest slot when only some of "
           "the ring has ever been written (a never-written slot reads back as a "
           "factory-reset, all-0xFF page, just like real EEPROM hardware)") {
   FakeEeprom eeprom(4096);
 
   {
+    DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
+    deadList.formatNew();
+
     Ring writer(/*recordId=*/0, eeprom);
     writer.setPageNum(4);
+    writer.setDeadPageOracle(deadList);
 
     // Only write 2 of the ring's 4 slots; slots 2 and 3 stay untouched, so
     // they still read back as FakeEeprom's factory-reset 0xFF fill --
@@ -183,7 +241,7 @@ TEST_CASE("after a reboot, load() correctly finds the latest slot when only some
 TEST_CASE("a write that fails its readback verification is marked dead, and the "
           "ring transparently retries the next live slot") {
   FakeEeprom eeprom(4096);
-  DeadList deadList(eeprom, 0);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
   deadList.formatNew();
 
   Ring ring(/*recordId=*/0, eeprom);
@@ -217,7 +275,7 @@ TEST_CASE("a write that fails its readback verification is marked dead, and the 
 TEST_CASE("store() gives up without writing anywhere once half or more of the "
           "ring's slots are already dead") {
   FakeEeprom eeprom(4096);
-  DeadList deadList(eeprom, 0);
+  DeadList deadList(eeprom, kDeadListCopyA, kDeadListCopyB);
   deadList.formatNew();
   deadList.markPageDead(4 + 0);
   deadList.markPageDead(4 + 2); // 2 of 4 slots dead == half.
