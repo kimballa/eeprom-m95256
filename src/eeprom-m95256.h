@@ -156,6 +156,9 @@ class SpiEeprom : public GenericSpiEeprom {
 public:
   using addr_t = uint16_t;
 
+  /** Default timeout for waitForWriteComplete(), in milliseconds. */
+  static constexpr unsigned long DEFAULT_TIMEOUT_MILLIS = 10;
+
   SpiEeprom(SpiEepromChipSelect &chipSel)
       : _chipSel(chipSel),
         _EEPROM_SPI_SETTINGS(_EEPROM_M95256_MAX_CLK, MSBFIRST, SPI_MODE0){};
@@ -183,7 +186,10 @@ public:
     // Clamp read size to top of addr space.
     count = min(count, (size_t)(BYTE_SIZE - addr));
 
-    waitForWriteComplete();
+    if (!waitForWriteComplete()) {
+      Serial.println("ERROR: Timed out waiting for previous write to complete.");
+      return 0;
+    }
     size_t nOut = 0, nIn = 0;
     uint8_t addrBuf[ADDR_LEN];
     addrBuf[0] = (addr >> 8) & 0xFF;
@@ -211,6 +217,10 @@ public:
    * You can use the waitForWriteComplete() method after this method returns
    * to block until that commit happens, or use isWriteInProgress() to
    * interrogate the status of the device in a non-blocking fashion.
+   *
+   * If a previous write transaction does not complete within
+   * waitForWriteComplete()'s timeout, this method aborts and returns the
+   * number of bytes successfully written so far.
    *
    * Returns the number of bytes written.
    */
@@ -244,7 +254,11 @@ public:
       }
 
       // Start by ensuring any previous write tx is complete.
-      waitForWriteComplete();
+      if (!waitForWriteComplete()) {
+        Serial.println(
+            "ERROR: Timed out waiting for previous write to complete.");
+        break;
+      }
 
       if (forceSuppressEepromWrite) {
         Serial.println(
@@ -294,12 +308,23 @@ public:
     return (readStatusRegister() & EEPROM_STATUS_REG_WRITE_IN_PROGRESS) != 0;
   };
 
-  /** Blocks until there is no pending WRITE operation. */
-  void waitForWriteComplete() const {
+  /**
+   * Blocks until there is no pending WRITE operation, or until
+   * 'timeoutMillis' has elapsed, whichever comes first.
+   *
+   * Returns true if the write completed, or false if we timed out while
+   * waiting.
+   */
+  bool waitForWriteComplete(unsigned long timeoutMillis = DEFAULT_TIMEOUT_MILLIS) const {
+    unsigned long startMillis = millis();
     while (isWriteInProgress()) {
+      if (millis() - startMillis >= timeoutMillis) {
+        return false;
+      }
       // Write operation is 5ms max, check for completion every 1ms.
       delayMicroseconds(1000);
     }
+    return true;
   };
 
   size_t getSizeBytes() const { return BYTE_SIZE; };

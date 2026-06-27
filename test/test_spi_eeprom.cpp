@@ -192,8 +192,80 @@ TEST_CASE("isWriteInProgress()/waitForWriteComplete() reflect the device's WIP "
   // rather than returning early.
   fakeSpiBusInstance()->setBusyPollsPerWrite(4);
   CHECK(dev.write(out, 0, sizeof(out)) == sizeof(out));
-  dev.waitForWriteComplete();
+  CHECK(dev.waitForWriteComplete() == true);
   CHECK(dev.isWriteInProgress() == false);
+}
+
+TEST_CASE("waitForWriteComplete() returns false if the device is still busy "
+          "once its timeout elapses") {
+  resetFakeSpiBus(256);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
+  dev.setup();
+
+  // Arm far more busy polls than the short timeout below will wait out. Must
+  // be set *before* the write below, since the fake bus only latches the
+  // busy-poll count at the end of a WRITE-opcode transaction.
+  fakeSpiBusInstance()->setBusyPollsPerWrite(1000);
+  uint8_t out[4] = {1, 2, 3, 4};
+  CHECK(dev.write(out, 0, sizeof(out)) == sizeof(out));
+
+  CHECK(dev.isWriteInProgress() == true);
+  CHECK(dev.waitForWriteComplete(5) == false); // Still busy after 5ms.
+}
+
+TEST_CASE("waitForWriteComplete() returns true once the device actually "
+          "clears, well within its timeout") {
+  resetFakeSpiBus(256);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
+  dev.setup();
+
+  fakeSpiBusInstance()->setBusyPollsPerWrite(2);
+  uint8_t out[4] = {1, 2, 3, 4};
+  CHECK(dev.write(out, 0, sizeof(out)) == sizeof(out));
+  CHECK(dev.waitForWriteComplete(50) == true);
+  CHECK(dev.isWriteInProgress() == false);
+}
+
+TEST_CASE("read() fails (returns 0) if a previous write does not complete "
+          "within waitForWriteComplete()'s default timeout") {
+  resetFakeSpiBus(256);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
+  dev.setup();
+
+  // Device never reports ready again, so read()'s internal
+  // waitForWriteComplete() call must time out. Set *before* the write so the
+  // fake bus latches it at that write's commit.
+  fakeSpiBusInstance()->setBusyPollsPerWrite(1000);
+  uint8_t out[4] = {1, 2, 3, 4};
+  CHECK(dev.write(out, 0, sizeof(out)) == sizeof(out));
+  CHECK(dev.isWriteInProgress() == true);
+
+  uint8_t in[4] = {0};
+  CHECK(dev.read(in, 0, sizeof(in)) == 0);
+}
+
+TEST_CASE("write() aborts (writes nothing) if a previous write does not "
+          "complete within waitForWriteComplete()'s default timeout") {
+  resetFakeSpiBus(256);
+  GpioSpiEepromChipSelect cs(10);
+  TestEeprom dev(cs);
+  dev.setup();
+
+  // Device never reports ready again, so write()'s pre-page
+  // waitForWriteComplete() call must time out and abort before issuing a new
+  // page-write transaction. Set *before* the write so the fake bus latches
+  // it at that write's commit.
+  fakeSpiBusInstance()->setBusyPollsPerWrite(1000);
+  uint8_t out[4] = {1, 2, 3, 4};
+  CHECK(dev.write(out, 0, sizeof(out)) == sizeof(out));
+  size_t txCountBefore = fakeSpiBusInstance()->writeTransactionCount();
+  CHECK(dev.isWriteInProgress() == true);
+
+  CHECK(dev.write(out, 0, sizeof(out)) == 0);
+  CHECK(fakeSpiBusInstance()->writeTransactionCount() == txCountBefore);
 }
 
 TEST_CASE("a multi-page write still lands all its data correctly even when the "
